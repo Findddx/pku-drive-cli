@@ -1,0 +1,14 @@
+[
+  {
+    "id": "gns://library-a",
+    "name": "Library A",
+    "type": "user_doc_lib",
+    "rev": "lib-r1"
+  },
+  {
+    "id": "gns://library-b",
+    "name": "共享 + 资料",
+    "type": "shared_doc_lib",
+    "rev": "lib-r2"
+  }
+]

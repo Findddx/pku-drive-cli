@@ -1,0 +1,28 @@
+{
+  "dirs": [
+    {
+      "docid": "gns://legacy-dir",
+      "name": "Old Folder",
+      "type": "legacy-dir-value",
+      "rev": "dir-r1",
+      "size": 0,
+      "modified": 1767323045123456,
+      "client_mtime": 1767323045000000
+    }
+  ],
+  "files": [
+    {
+      "id": "gns://new-file",
+      "name": "New File.txt",
+      "type": "new-file-value",
+      "rev": "file-r1",
+      "size": 17,
+      "modified_at": "2026-01-02T03:04:05.123456Z",
+      "client_mtime": 1767323045000001,
+      "custom_metadata": {
+        "client_mtime": 1767323045999999
+      }
+    }
+  ],
+  "next_marker": "页/2 +"
+}

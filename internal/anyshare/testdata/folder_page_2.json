@@ -1,0 +1,23 @@
+{
+  "dirs": [
+    {
+      "id": "gns://new-dir",
+      "name": "New Folder",
+      "type": "another-dir-value",
+      "rev": "dir-r2",
+      "modified_at": "2026-01-02T03:04:06Z"
+    }
+  ],
+  "files": [
+    {
+      "docid": "gns://legacy-file",
+      "name": "Old File.bin",
+      "type": "another-file-value",
+      "rev": "file-r2",
+      "size": 23,
+      "modified": 1767323047000000,
+      "client_mtime": 1767323045000004
+    }
+  ],
+  "next_marker": ""
+}

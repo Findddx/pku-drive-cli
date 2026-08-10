@@ -1,0 +1,11 @@
+--synthetic-boundary
+Content-Disposition: form-data; name="completion"; filename="complete.xml"
+Content-Type: application/xml
+
+<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"synthetic-one"</ETag></Part><Part><PartNumber>10</PartNumber><ETag>"synthetic-ten"</ETag></Part></CompleteMultipartUpload>
+--synthetic-boundary
+Content-Disposition: form-data; name="authorization"
+Content-Type: application/json; charset=utf-8
+
+{"authrequest":["PUT","https://objects.example/complete?signature=synthetic-completion-query","Content-Type: application/xml","Authorization: AWS synthetic-completion-authorization"]}
+--synthetic-boundary--

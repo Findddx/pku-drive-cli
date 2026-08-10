@@ -1,0 +1,6 @@
+.worktrees/
+/bin/
+/dist/
+/.pku-drive-build.*/
+/.pku-drive-contract.*/
+/.pku-drive-package.*/
