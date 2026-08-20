@@ -18,6 +18,7 @@ import (
 	"github.com/Findddx/pku-drive-cli/internal/httpx"
 	"github.com/Findddx/pku-drive-cli/internal/oauth"
 	"github.com/Findddx/pku-drive-cli/internal/remote"
+	"github.com/Findddx/pku-drive-cli/internal/sharelink"
 	"github.com/Findddx/pku-drive-cli/internal/upload"
 )
 
@@ -59,12 +60,17 @@ type downloaderOperations interface {
 	Get(context.Context, anyshare.Item, string, bool, download.Progress) (download.Result, error)
 }
 
+type shareOperations interface {
+	Open(context.Context, string) (*sharelink.Session, error)
+}
+
 type dependencyServices struct {
 	manager    authOperations
 	identity   identityOperations
 	remote     remoteOperations
 	uploader   uploaderOperations
 	downloader downloaderOperations
+	shares     shareOperations
 }
 
 func wireDependencies() cli.Dependencies {
@@ -109,8 +115,12 @@ func newWiredRuntime(options wireOptions) (*wiredRuntime, error) {
 	remoteService := remote.NewService(api)
 	uploader := upload.NewUploader(server, api, remoteService, upload.NewStateStore(storagePaths.UploadStateDir), 4)
 	downloader := download.NewDownloader(api)
+	shares, err := sharelink.NewOpener(server, httpClient, api)
+	if err != nil {
+		return nil, err
+	}
 	dependencies := dependenciesFromServices(dependencyServices{
-		manager: manager, identity: api, remote: remoteService, uploader: uploader, downloader: downloader,
+		manager: manager, identity: api, remote: remoteService, uploader: uploader, downloader: downloader, shares: shares,
 	})
 	return &wiredRuntime{dependencies: dependencies, httpClient: httpClient, uploader: uploader}, nil
 }
@@ -191,6 +201,16 @@ func dependenciesFromServices(services dependencyServices) cli.Dependencies {
 			}
 			return cli.GetResult{RemotePath: item.Path, RemoteID: result.RemoteID, Revision: result.Revision, LocalPath: result.LocalPath, Size: result.Size}, nil
 		},
+		OpenShare: func(ctx context.Context, rawLink string) (cli.ShareSession, error) {
+			if services.shares == nil {
+				return nil, apperr.Wrap(apperr.Local, "share link", "share dependency unavailable", errors.New("missing share dependency"))
+			}
+			session, err := services.shares.Open(ctx, rawLink)
+			if err != nil {
+				return nil, err
+			}
+			return &cliShareSession{session: session}, nil
+		},
 		Delete: func(ctx context.Context, remotePath string, recursive bool) (cli.DeleteResult, error) {
 			result, err := services.remote.Delete(ctx, remotePath, recursive)
 			if err != nil {
@@ -259,9 +279,57 @@ func unavailableDependencies(cause error) cli.Dependencies {
 		Get: func(ctx context.Context, _, _ string, _ bool, _ upload.Progress) (cli.GetResult, error) {
 			return cli.GetResult{}, failure(ctx, "get")
 		},
+		OpenShare: func(ctx context.Context, _ string) (cli.ShareSession, error) {
+			return nil, failure(ctx, "share link")
+		},
 		Delete: func(ctx context.Context, _ string, _ bool) (cli.DeleteResult, error) {
 			return cli.DeleteResult{}, failure(ctx, "rm")
 		},
 		Logout: func(ctx context.Context, _ bool) error { return failure(ctx, "logout") },
 	}
+}
+
+type cliShareSession struct{ session *sharelink.Session }
+
+func (session *cliShareSession) Root() cli.ShareEntry {
+	if session == nil || session.session == nil {
+		return cli.ShareEntry{}
+	}
+	return shareEntryResult(session.session.Root())
+}
+
+func (session *cliShareSession) List(ctx context.Context, relativeDir string) ([]cli.ShareEntry, error) {
+	if session == nil || session.session == nil {
+		return nil, apperr.Wrap(apperr.Local, "share link", "share dependency unavailable", errors.New("missing share session"))
+	}
+	entries, err := session.session.List(ctx, relativeDir)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]cli.ShareEntry, len(entries))
+	for index, entry := range entries {
+		results[index] = shareEntryResult(entry)
+	}
+	return results, nil
+}
+
+func (session *cliShareSession) Download(ctx context.Context, relativeFiles []string, localDir string, overwrite bool, progress upload.Progress) ([]cli.ShareGetResult, error) {
+	if session == nil || session.session == nil {
+		return nil, apperr.Wrap(apperr.Local, "share link", "share dependency unavailable", errors.New("missing share session"))
+	}
+	downloaded, err := session.session.Download(ctx, relativeFiles, localDir, overwrite, progress)
+	results := make([]cli.ShareGetResult, len(downloaded))
+	for index, item := range downloaded {
+		results[index] = cli.ShareGetResult{
+			SharePath: item.Entry.Path,
+			Revision:  item.Result.Revision,
+			LocalPath: item.Result.LocalPath,
+			Size:      item.Result.Size,
+		}
+	}
+	return results, err
+}
+
+func shareEntryResult(entry sharelink.Entry) cli.ShareEntry {
+	return cli.ShareEntry{Name: entry.Name, SharePath: entry.Path, Type: entry.Type, Size: entry.Size}
 }

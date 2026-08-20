@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -38,10 +39,40 @@ type calls struct {
 	progressSet  bool
 	pasteLogin   bool
 	loginInput   bool
+	shareLink    string
+	shareListDir string
+	sharePaths   []string
+	shareLocal   string
+}
+
+type shareSessionFake struct {
+	root      cli.ShareEntry
+	entries   []cli.ShareEntry
+	downloads []cli.ShareGetResult
+	calls     *calls
+}
+
+func (s *shareSessionFake) Root() cli.ShareEntry { return s.root }
+
+func (s *shareSessionFake) List(_ context.Context, relativeDir string) ([]cli.ShareEntry, error) {
+	s.calls.shareListDir = relativeDir
+	return append([]cli.ShareEntry(nil), s.entries...), nil
+}
+
+func (s *shareSessionFake) Download(_ context.Context, paths []string, localDir string, overwrite bool, progress upload.Progress) ([]cli.ShareGetResult, error) {
+	s.calls.sharePaths = append([]string(nil), paths...)
+	s.calls.shareLocal = localDir
+	s.calls.overwrite = overwrite
+	if progress != nil {
+		progress.Started(9)
+		progress.Advanced(9)
+		progress.Finished()
+	}
+	return append([]cli.ShareGetResult(nil), s.downloads...), nil
 }
 
 func dependencies(c *calls) cli.Dependencies {
-	return cli.Dependencies{
+	deps := cli.Dependencies{
 		Login: func(ctx context.Context, input io.Reader, notice io.Writer, paste bool) error {
 			_, _ = io.WriteString(notice, "Authorize at https://disk.example.invalid/oauth\n")
 			c.loginNotice = "written"
@@ -90,6 +121,117 @@ func dependencies(c *calls) cli.Dependencies {
 			c.localOnly, c.deadline = localOnly, remaining(ctx)
 			return nil
 		},
+	}
+	deps.OpenShare = func(_ context.Context, link string) (cli.ShareSession, error) {
+		c.shareLink = link
+		return &shareSessionFake{
+			root:      cli.ShareEntry{Name: "shared-root", SharePath: "", Type: "directory", Size: -1},
+			entries:   []cli.ShareEntry{{Name: "a.tsv", SharePath: "数据/a.tsv", Type: "file", Size: 9}},
+			downloads: []cli.ShareGetResult{{SharePath: "数据/a.tsv", Revision: "r1", LocalPath: "/tmp/out/数据/a.tsv", Size: 9}},
+			calls:     c,
+		}, nil
+	}
+	return deps
+}
+
+func TestRunShareListAndExplicitDownloadJSON(t *testing.T) {
+	const link = "https://disk.pku.edu.cn/link/AA-ShareCapabilityMarker"
+
+	t.Run("list share directory", func(t *testing.T) {
+		c := new(calls)
+		code, stdout, stderr := run(t, []string{"ls", "--share", link, "数据", "--json"}, dependencies(c))
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		entries, _ := got["entries"].([]any)
+		if c.shareLink != link || c.shareListDir != "数据" || len(entries) != 1 {
+			t.Fatalf("calls=%+v envelope=%v", c, got)
+		}
+		entry := entries[0].(map[string]any)
+		if entry["share_path"] != "数据/a.tsv" || entry["type"] != "file" || entry["size"] != float64(9) {
+			t.Fatalf("entry=%v", entry)
+		}
+		if strings.Contains(stdout, "ShareCapabilityMarker") {
+			t.Fatalf("share capability leaked to stdout: %q", stdout)
+		}
+	})
+
+	t.Run("download explicit shared files", func(t *testing.T) {
+		c := new(calls)
+		code, stdout, stderr := run(t, []string{"get", "--share", link, "/tmp/out", "数据/a.tsv", "--overwrite", "--quiet", "--json"}, dependencies(c))
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		downloads, _ := got["downloads"].([]any)
+		if c.shareLink != link || c.shareLocal != "/tmp/out" || !c.overwrite || !reflect.DeepEqual(c.sharePaths, []string{"数据/a.tsv"}) || len(downloads) != 1 {
+			t.Fatalf("calls=%+v envelope=%v", c, got)
+		}
+		result := downloads[0].(map[string]any)
+		if result["share_path"] != "数据/a.tsv" || result["local_path"] != "/tmp/out/数据/a.tsv" || result["size"] != float64(9) {
+			t.Fatalf("download=%v", result)
+		}
+		if strings.Contains(stdout, "ShareCapabilityMarker") {
+			t.Fatalf("share capability leaked to stdout: %q", stdout)
+		}
+	})
+}
+
+func TestRunShareGetNonInteractiveSelectionRules(t *testing.T) {
+	const link = "https://disk.pku.edu.cn/link/AA-ShareCapabilityMarker"
+
+	t.Run("directory share with JSON requires paths", func(t *testing.T) {
+		code, stdout, stderr := run(t, []string{"get", "--share", link, "/tmp/out", "--json"}, dependencies(new(calls)))
+		if code != 2 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		if got["category"] != "usage" || strings.Contains(stdout, "ShareCapabilityMarker") {
+			t.Fatalf("envelope=%v", got)
+		}
+	})
+
+	t.Run("single file share downloads without picker", func(t *testing.T) {
+		c := new(calls)
+		deps := dependencies(c)
+		deps.OpenShare = func(_ context.Context, got string) (cli.ShareSession, error) {
+			c.shareLink = got
+			return &shareSessionFake{
+				root:      cli.ShareEntry{Name: "single.tsv", SharePath: "single.tsv", Type: "file", Size: 9},
+				downloads: []cli.ShareGetResult{{SharePath: "single.tsv", LocalPath: "/tmp/out/single.tsv", Size: 9}},
+				calls:     c,
+			}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--share", link, "/tmp/out", "--quiet", "--json"}, deps)
+		if code != 0 || stderr != "" || !reflect.DeepEqual(c.sharePaths, []string{"single.tsv"}) {
+			t.Fatalf("code=%d calls=%+v stdout=%q stderr=%q", code, c, stdout, stderr)
+		}
+	})
+}
+
+func TestRunShareHumanOutputEscapesUntrustedNames(t *testing.T) {
+	const link = "https://disk.pku.edu.cn/link/AA-ShareCapabilityMarker"
+	c := new(calls)
+	deps := dependencies(c)
+	deps.OpenShare = func(context.Context, string) (cli.ShareSession, error) {
+		return &shareSessionFake{
+			root:    cli.ShareEntry{Name: "root", Type: "directory", Size: -1},
+			entries: []cli.ShareEntry{{Name: "unsafe", SharePath: "报告\x1b]8;;https://evil.invalid\a.tsv\nnext", Type: "file", Size: 9}},
+			calls:   c,
+		}, nil
+	}
+	code, stdout, stderr := run(t, []string{"ls", "--share", link}, deps)
+	if code != 0 || stderr != "" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if strings.ContainsAny(stdout, "\x1b\a") || strings.Count(stdout, "\n") != 1 {
+		t.Fatalf("unsafe terminal output: %q", stdout)
+	}
+	for _, want := range []string{`\x1B`, `\x07`, `\x0A`} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout=%q missing %q", stdout, want)
+		}
 	}
 }
 

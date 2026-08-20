@@ -37,6 +37,7 @@ var (
 type localLinuxOps struct {
 	open           func(string, int, uint32) (int, error)
 	openat         func(int, string, int, uint32) (int, error)
+	mkdirat        func(int, string, uint32) error
 	fstat          func(int, *syscall.Stat_t) error
 	close          func(int) error
 	fsync          func(int) error
@@ -48,6 +49,7 @@ type localLinuxOps struct {
 var hostLocalLinuxOps = localLinuxOps{
 	open:           syscall.Open,
 	openat:         syscall.Openat,
+	mkdirat:        syscall.Mkdirat,
 	fstat:          syscall.Fstat,
 	close:          syscall.Close,
 	fsync:          syscall.Fsync,
@@ -113,6 +115,50 @@ type downloadTarget struct {
 	closed    bool
 }
 
+// DestinationRoot binds an existing local directory for a group of relative
+// downloads. The held descriptor remains authoritative even if a pathname is
+// renamed or replaced while the batch is running.
+type DestinationRoot struct {
+	directory *ownedLocalFD
+	path      string
+	ops       localLinuxOps
+	closed    bool
+}
+
+// OpenDestinationRoot opens an existing directory without following symbolic
+// links in any path component.
+func OpenDestinationRoot(path string) (*DestinationRoot, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	abs = filepath.Clean(abs)
+	directory, err := openBoundDirectory(abs, hostLocalLinuxOps)
+	if err != nil {
+		return nil, err
+	}
+	return &DestinationRoot{directory: directory, path: abs, ops: hostLocalLinuxOps}, nil
+}
+
+// Close releases the directory descriptor. It is idempotent.
+func (r *DestinationRoot) Close() error {
+	if r == nil || r.closed {
+		return nil
+	}
+	r.closed = true
+	return r.directory.Close()
+}
+
+// Preflight validates one relative destination and creates only its missing
+// parent directories. It performs no network access and publishes no file.
+func (r *DestinationRoot) Preflight(relative string, overwrite bool) error {
+	target, _, err := r.openTarget(relative, overwrite)
+	if err != nil {
+		return err
+	}
+	return target.Close()
+}
+
 func openDownloadTarget(path string, overwrite bool) (*downloadTarget, error) {
 	return openDownloadTargetWithOps(path, overwrite, hostLocalLinuxOps, rand.Reader)
 }
@@ -128,6 +174,16 @@ func openDownloadTargetWithOps(path string, overwrite bool, ops localLinuxOps, r
 	directory, err := openBoundDirectory(filepath.Dir(path), ops)
 	if err != nil {
 		return nil, err
+	}
+	return newDownloadTarget(directory, name, overwrite, ops, random)
+}
+
+func newDownloadTarget(directory *ownedLocalFD, name string, overwrite bool, ops localLinuxOps, random io.Reader) (*downloadTarget, error) {
+	if directory == nil || directory.fd < 0 || name == "" || name == "." || name == ".." || strings.ContainsRune(name, filepath.Separator) || strings.ContainsRune(name, '\x00') {
+		if directory != nil {
+			_ = directory.Close()
+		}
+		return nil, errUnsafeLocalEntry
 	}
 	target := &downloadTarget{directory: directory, name: name, overwrite: overwrite, ops: ops, random: random}
 	existing, err := target.openEntry(name)
@@ -150,6 +206,70 @@ func openDownloadTargetWithOps(path string, overwrite bool, ops localLinuxOps, r
 	}
 	target.existing = existing
 	return target, nil
+}
+
+func (r *DestinationRoot) openTarget(relative string, overwrite bool) (*downloadTarget, string, error) {
+	components, err := safeRelativeComponents(relative)
+	if err != nil || r == nil || r.closed || r.directory == nil || r.directory.fd < 0 {
+		return nil, "", errUnsafeLocalEntry
+	}
+	currentFD, err := r.ops.openat(r.directory.fd, ".", syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, "", err
+	}
+	current := newOwnedLocalFD(currentFD, r.ops.close)
+	for _, component := range components[:len(components)-1] {
+		nextFD, openErr := r.ops.openat(current.fd, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		if errors.Is(openErr, syscall.ENOENT) {
+			if r.ops.mkdirat == nil {
+				_ = current.Close()
+				return nil, "", errUnsafeLocalEntry
+			}
+			mkdirErr := r.ops.mkdirat(current.fd, component, 0o700)
+			if mkdirErr != nil && !errors.Is(mkdirErr, syscall.EEXIST) {
+				_ = current.Close()
+				return nil, "", mkdirErr
+			}
+			nextFD, openErr = r.ops.openat(current.fd, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+		}
+		if openErr != nil {
+			_ = current.Close()
+			return nil, "", openErr
+		}
+		next := newOwnedLocalFD(nextFD, r.ops.close)
+		var stat syscall.Stat_t
+		if err := r.ops.fstat(next.fd, &stat); err != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFDIR {
+			_ = next.Close()
+			_ = current.Close()
+			if err != nil {
+				return nil, "", err
+			}
+			return nil, "", errUnsafeLocalEntry
+		}
+		if err := current.Close(); err != nil {
+			_ = next.Close()
+			return nil, "", err
+		}
+		current = next
+	}
+	target, err := newDownloadTarget(current, components[len(components)-1], overwrite, r.ops, rand.Reader)
+	if err != nil {
+		return nil, "", err
+	}
+	return target, filepath.Join(append([]string{r.path}, components...)...), nil
+}
+
+func safeRelativeComponents(relative string) ([]string, error) {
+	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.ContainsRune(relative, '\x00') || strings.Contains(relative, "//") {
+		return nil, errUnsafeLocalEntry
+	}
+	components := strings.Split(relative, string(filepath.Separator))
+	for _, component := range components {
+		if component == "" || component == "." || component == ".." {
+			return nil, errUnsafeLocalEntry
+		}
+	}
+	return components, nil
 }
 
 func (t *downloadTarget) Close() error {

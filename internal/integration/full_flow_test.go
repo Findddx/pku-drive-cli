@@ -34,6 +34,7 @@ import (
 	"github.com/Findddx/pku-drive-cli/internal/httpx"
 	"github.com/Findddx/pku-drive-cli/internal/oauth"
 	"github.com/Findddx/pku-drive-cli/internal/remote"
+	"github.com/Findddx/pku-drive-cli/internal/sharelink"
 	"github.com/Findddx/pku-drive-cli/internal/upload"
 	"github.com/Findddx/pku-drive-cli/internal/version"
 )
@@ -43,6 +44,20 @@ const (
 	fixtureRefreshedAccess = "fixture-access-refreshed"
 	fixtureRefresh         = "fixture-refresh"
 	fixtureSecret          = "fixture-secret"
+	fixtureShareToken      = "fake-share-token-marker"
+
+	fixturePublicLinkID   = "FakePublicLinkMarker"
+	fixtureRealnameLinkID = "FakeRealnameLinkMarker"
+	fixturePasswordLinkID = "FakePasswordLinkMarker"
+	fixtureMobileLinkID   = "FakeMobileLinkMarker"
+	fixtureRedirectLinkID = "FakeRedirectLinkMarker"
+
+	fixturePublicRootID = "gns://fixture-share-public-root"
+	fixturePublicDirID  = "gns://fixture-share-public-dir"
+	fixturePublicFileID = "gns://fixture-share-public-file"
+	fixturePublicTopID  = "gns://fixture-share-public-top"
+	fixtureRealRootID   = "gns://fixture-share-real-root"
+	fixtureRealFileID   = "gns://fixture-share-real-file"
 )
 
 var fixtureNow = time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC)
@@ -124,6 +139,7 @@ func newFixture(t *testing.T) *fixture {
 		activeAccess: fixtureAccess,
 	}
 	f.nodes["gns://library"] = &fixtureNode{ID: "gns://library", Name: "个人文档", Type: "directory", Rev: "library-r1", Path: "/个人文档", Size: -1}
+	f.addShareFixtures()
 	f.objects = httptest.NewTLSServer(http.HandlerFunc(f.handleObject))
 	f.control = httptest.NewTLSServer(http.HandlerFunc(f.handleControl))
 	t.Cleanup(f.control.Close)
@@ -131,9 +147,134 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+func (f *fixture) addShareFixtures() {
+	addFile := func(id, parentID, name, path, revision string, data []byte) {
+		evidence := contentEvidence(name, data, fixtureNow.UnixNano()/1000, false)
+		f.nodes[id] = &fixtureNode{
+			ID: id, ParentID: parentID, Name: name, Type: "file", Rev: revision, Path: path,
+			Size: evidence.Size, ClientMtimeUS: evidence.ClientMtimeUS, MD5: evidence.MD5,
+			SliceMD5: evidence.SliceMD5, CRC32: evidence.CRC32,
+		}
+		f.files[path] = append([]byte(nil), data...)
+	}
+
+	f.nodes[fixturePublicRootID] = &fixtureNode{ID: fixturePublicRootID, Name: "公开分享", Type: "directory", Rev: "share-public-root-r1", Path: "/fixture/share/public", Size: -1}
+	f.nodes[fixturePublicDirID] = &fixtureNode{ID: fixturePublicDirID, ParentID: fixturePublicRootID, Name: "sub", Type: "directory", Rev: "share-public-dir-r1", Path: "/fixture/share/public/sub", Size: -1}
+	addFile(fixturePublicFileID, fixturePublicDirID, "nested.txt", "/fixture/share/public/sub/nested.txt", "share-public-file-r1", []byte("fake anonymous share payload\n"))
+	addFile(fixturePublicTopID, fixturePublicRootID, "top.txt", "/fixture/share/public/top.txt", "share-public-top-r1", []byte("fake top-level share payload\n"))
+
+	f.nodes[fixtureRealRootID] = &fixtureNode{ID: fixtureRealRootID, Name: "组织分享", Type: "directory", Rev: "share-real-root-r1", Path: "/fixture/share/real", Size: -1}
+	addFile(fixtureRealFileID, fixtureRealRootID, "member.txt", "/fixture/share/real/member.txt", "share-real-file-r1", []byte("fake organization share payload\n"))
+}
+
+type fixtureShareInfo struct {
+	linkType, itemType, title, rootID string
+	passwordRequired, verifyMobile    bool
+}
+
+func lookupFixtureShare(linkID string) (fixtureShareInfo, bool) {
+	switch linkID {
+	case fixturePublicLinkID:
+		return fixtureShareInfo{linkType: "anonymous", itemType: "folder", title: "公开分享", rootID: fixturePublicRootID}, true
+	case fixtureRealnameLinkID:
+		return fixtureShareInfo{linkType: "realname", itemType: "folder", title: "组织分享", rootID: fixtureRealRootID}, true
+	case fixturePasswordLinkID:
+		return fixtureShareInfo{linkType: "anonymous", itemType: "folder", title: "口令分享", rootID: fixturePublicRootID, passwordRequired: true}, true
+	case fixtureMobileLinkID:
+		return fixtureShareInfo{linkType: "anonymous", itemType: "folder", title: "手机验证分享", rootID: fixturePublicRootID, verifyMobile: true}, true
+	case fixtureRedirectLinkID:
+		return fixtureShareInfo{linkType: "anonymous", itemType: "folder", title: "重定向分享", rootID: fixturePublicRootID}, true
+	default:
+		return fixtureShareInfo{}, false
+	}
+}
+
+func (f *fixture) startShareLanding(w http.ResponseWriter, r *http.Request) {
+	linkID := strings.TrimPrefix(r.URL.Path, "/link/")
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+		f.t.Errorf("initial shared-link request carried credentials")
+		http.Error(w, "unexpected credentials", http.StatusUnauthorized)
+		return
+	}
+	if linkID == fixtureRedirectLinkID {
+		w.Header().Set("Location", f.objects.URL+"/redirect-target")
+		w.WriteHeader(http.StatusFound)
+		return
+	}
+	info, ok := lookupFixtureShare(linkID)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	// The legacy AnyShare cookie name contains a colon, so write the fixture
+	// header exactly as the server does instead of using http.SetCookie.
+	w.Header().Add("Set-Cookie", "link_token:"+linkID+"="+fixtureShareToken+"; Path=/; Max-Age=3600; Secure; HttpOnly; SameSite=Lax")
+	query := url.Values{
+		"type":              {info.linkType},
+		"item_type":         {info.itemType},
+		"title":             {info.title},
+		"password_required": {strconv.FormatBool(info.passwordRequired)},
+		"verify_mobile":     {strconv.FormatBool(info.verifyMobile)},
+	}
+	w.Header().Set("Location", "/anyshare/link/"+linkID+"?"+query.Encode())
+	w.WriteHeader(http.StatusFound)
+}
+
+func (f *fixture) finishShareLanding(w http.ResponseWriter, r *http.Request) {
+	linkID := strings.TrimPrefix(r.URL.Path, "/anyshare/link/")
+	if _, ok := lookupFixtureShare(linkID); !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("Authorization") != "" || !hasFixtureShareCookie(r, linkID) {
+		f.t.Errorf("shared-link landing did not use its isolated cookie session")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, "<!doctype html><title>fixture share</title>")
+}
+
+func (f *fixture) shareMetadata(w http.ResponseWriter, r *http.Request) {
+	linkID := strings.TrimPrefix(r.URL.Path, "/api/shared-link/v1/links/")
+	info, ok := lookupFixtureShare(linkID)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" {
+		f.t.Errorf("shared-link metadata request carried credentials: authorization-present=%v cookie-present=%v", r.Header.Get("Authorization") != "", r.Header.Get("Cookie") != "")
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"type": info.linkType, "id": linkID, "title": info.title, "expires_at": 0,
+		"password_required": info.passwordRequired, "verify_mobile": info.verifyMobile,
+		"item": map[string]any{
+			"belongs_to": "document", "id": info.rootID, "type": info.itemType, "name": info.title,
+		},
+	})
+}
+
+func hasFixtureShareCookie(r *http.Request, linkID string) bool {
+	want := "link_token:" + linkID + "=" + fixtureShareToken
+	for _, part := range strings.Split(r.Header.Get("Cookie"), ";") {
+		if strings.TrimSpace(part) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (f *fixture) handleControl(w http.ResponseWriter, r *http.Request) {
 	f.recordCall(r.URL.Path)
 	switch {
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/link/"):
+		f.startShareLanding(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/anyshare/link/"):
+		f.finishShareLanding(w, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/shared-link/v1/links/"):
+		f.shareMetadata(w, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/oauth2/clients":
 		var request struct {
 			ClientName             string   `json:"client_name"`
@@ -235,8 +376,16 @@ func (f *fixture) handleControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, []map[string]any{{"id": "gns://library", "docid": "gns://library", "name": "个人文档", "path": "/个人文档", "type": "user_doc_lib", "size": -1}})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/efast/v1/entry-item":
+		if !f.requireShareBearer(w, r) {
+			return
+		}
+		writeJSON(w, []map[string]any{{
+			"id": fixturePublicRootID, "docid": fixturePublicRootID, "name": "公开分享",
+			"path": "/fixture/share/public", "type": "folder", "rev": "share-public-root-r1", "size": -1,
+		}})
 	case strings.HasPrefix(r.URL.Path, "/api/efast/"):
-		if !f.requireBearer(w, r) {
+		if !f.requireDocumentBearer(w, r) {
 			return
 		}
 		f.handleDocuments(w, r)
@@ -888,7 +1037,7 @@ func (f *fixture) handleObject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fixture) downloadObject(w http.ResponseWriter, r *http.Request, authorization string) {
-	if authorization != "" || r.Header.Get("x-as-userid") != "" || r.URL.Query().Get("signature") != "fixture-download" {
+	if authorization != "" || r.Header.Get("Cookie") != "" || r.Header.Get("x-as-userid") != "" || r.URL.Query().Get("signature") != "fixture-download" {
 		http.Error(w, "bad signed download", http.StatusUnauthorized)
 		return
 	}
@@ -960,6 +1109,57 @@ func (f *fixture) requireBearer(w http.ResponseWriter, r *http.Request) bool {
 		return false
 	}
 	return true
+}
+
+func (f *fixture) requireShareBearer(w http.ResponseWriter, r *http.Request) bool {
+	if r.Header.Get("Authorization") != "Bearer "+fixtureShareToken || r.Header.Get("Cookie") != "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func (f *fixture) requireDocumentBearer(w http.ResponseWriter, r *http.Request) bool {
+	docID := fixtureDocumentID(r)
+	if isFixturePublicDocument(docID) {
+		return f.requireShareBearer(w, r)
+	}
+	return f.requireBearer(w, r)
+}
+
+func fixtureDocumentID(r *http.Request) string {
+	const folderPrefix = "/api/efast/v1/folders/"
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, folderPrefix) && strings.HasSuffix(r.URL.Path, "/sub_objects") {
+		raw := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, folderPrefix), "/sub_objects")
+		if decoded, err := url.PathUnescape(raw); err == nil {
+			return decoded
+		}
+		return raw
+	}
+	if r.Body == nil {
+		return ""
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return ""
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var request struct {
+		DocID string `json:"docid"`
+	}
+	if json.Unmarshal(body, &request) != nil {
+		return ""
+	}
+	return request.DocID
+}
+
+func isFixturePublicDocument(docID string) bool {
+	switch docID {
+	case fixturePublicRootID, fixturePublicDirID, fixturePublicFileID, fixturePublicTopID:
+		return true
+	default:
+		return false
+	}
 }
 
 func (f *fixture) recordCall(route string) {
@@ -1308,6 +1508,188 @@ func TestCLIGetAndDelete(t *testing.T) {
 	assertListingIncludes(t, runJSON(t, r, []string{"ls", base, "--json"}, 0), pendingPath)
 }
 
+func TestCLIShareLinkDownload(t *testing.T) {
+	t.Run("anonymous folder works without saved credentials", func(t *testing.T) {
+		f := newFixture(t)
+		r := newRuntime(t, f)
+		link := f.control.URL + "/link/" + fixturePublicLinkID
+
+		listing := runJSON(t, r, []string{"ls", "--share", link, "--json"}, 0)
+		if listing["source"] != "share" {
+			t.Fatalf("share listing=%v", listing)
+		}
+		entries, ok := listing["entries"].([]any)
+		if !ok || len(entries) != 2 {
+			t.Fatalf("share entries=%T %v", listing["entries"], listing["entries"])
+		}
+		wantFirstLevel := map[string]string{"sub": "directory", "top.txt": "file"}
+		for _, raw := range entries {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				t.Fatalf("share entry=%T %v", raw, raw)
+			}
+			path, _ := entry["share_path"].(string)
+			if entry["type"] != wantFirstLevel[path] || entry["name"] != path || strings.Contains(path, "nested.txt") {
+				t.Fatalf("first-level share entry=%v", entry)
+			}
+		}
+
+		destination := t.TempDir()
+		result := runJSON(t, r, []string{"get", "--share", link, destination, "sub/nested.txt", "--json"}, 0)
+		if result["source"] != "share" {
+			t.Fatalf("share download=%v", result)
+		}
+		downloads, ok := result["downloads"].([]any)
+		if !ok || len(downloads) != 1 {
+			t.Fatalf("share downloads=%T %v", result["downloads"], result["downloads"])
+		}
+		downloaded := downloads[0].(map[string]any)
+		localPath := filepath.Join(destination, "sub", "nested.txt")
+		if downloaded["share_path"] != "sub/nested.txt" || downloaded["local_path"] != localPath || downloaded["revision"] != "share-public-file-r1" {
+			t.Fatalf("share download result=%v", downloaded)
+		}
+		want := f.fileBytes("/fixture/share/public/sub/nested.txt")
+		if got, err := os.ReadFile(localPath); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("anonymous share bytes=%q err=%v want=%q", got, err, want)
+		}
+		if info, err := os.Stat(localPath); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("anonymous share mode=%v err=%v want=0600", infoMode(info), err)
+		}
+		if info, err := os.Stat(filepath.Dir(localPath)); err != nil || info.Mode().Perm() != 0o700 {
+			t.Fatalf("anonymous share parent mode=%v err=%v want=0700", infoMode(info), err)
+		}
+
+		if got := f.callCount("/api/efast/v1/entry-item"); got != 2 {
+			t.Fatalf("anonymous entry-item calls=%d want=2", got)
+		}
+		if got := f.callCount(fixtureFolderRoute(fixturePublicRootID)); got != 2 {
+			t.Fatalf("anonymous root list calls=%d want=2", got)
+		}
+		if got := f.callCount(fixtureFolderRoute(fixturePublicDirID)); got != 1 {
+			t.Fatalf("anonymous nested list calls=%d want=1", got)
+		}
+		if got := f.callCount("/api/efast/v1/file/metadata"); got != 1 {
+			t.Fatalf("anonymous metadata calls=%d want=1", got)
+		}
+		if got := f.callCount("/api/efast/v1/file/osdownload"); got != 1 {
+			t.Fatalf("anonymous download authorization calls=%d want=1", got)
+		}
+		if got := f.callCount("object:/download"); got != 1 {
+			t.Fatalf("anonymous object calls=%d want=1", got)
+		}
+	})
+
+	t.Run("realname folder requires and then uses saved login", func(t *testing.T) {
+		f := newFixture(t)
+		r := newRuntime(t, f)
+		link := f.control.URL + "/link/" + fixtureRealnameLinkID
+		destination := t.TempDir()
+
+		unauthorized := runJSON(t, r, []string{"get", "--share", link, destination, "member.txt", "--json"}, 3)
+		if unauthorized["ok"] != false || unauthorized["category"] != "auth" {
+			t.Fatalf("realname without login=%v", unauthorized)
+		}
+		if got := f.callCountPrefix("/api/efast/"); got != 0 {
+			t.Fatalf("realname without login sent %d document requests", got)
+		}
+		if got := f.callCount("object:/download"); got != 0 {
+			t.Fatalf("realname without login sent %d object requests", got)
+		}
+
+		loginCLI(t, r)
+		result := runJSON(t, r, []string{"get", "--share", link, destination, "member.txt", "--json"}, 0)
+		downloads, ok := result["downloads"].([]any)
+		if result["source"] != "share" || !ok || len(downloads) != 1 {
+			t.Fatalf("realname download=%v", result)
+		}
+		downloaded := downloads[0].(map[string]any)
+		localPath := filepath.Join(destination, "member.txt")
+		if downloaded["share_path"] != "member.txt" || downloaded["local_path"] != localPath || downloaded["revision"] != "share-real-file-r1" {
+			t.Fatalf("realname download result=%v", downloaded)
+		}
+		want := f.fileBytes("/fixture/share/real/member.txt")
+		if got, err := os.ReadFile(localPath); err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("realname share bytes=%q err=%v want=%q", got, err, want)
+		}
+		if info, err := os.Stat(localPath); err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("realname share mode=%v err=%v want=0600", infoMode(info), err)
+		}
+		if got := f.callCount("/api/efast/v1/entry-item"); got != 0 {
+			t.Fatalf("realname used anonymous entry endpoint %d times", got)
+		}
+		if got := f.callCount(fixtureFolderRoute(fixtureRealRootID)); got != 1 {
+			t.Fatalf("realname root list calls=%d want=1", got)
+		}
+		if got := f.callCount("/api/efast/v1/file/metadata"); got != 1 {
+			t.Fatalf("realname metadata calls=%d want=1", got)
+		}
+		if got := f.callCount("/api/efast/v1/file/osdownload"); got != 1 {
+			t.Fatalf("realname download authorization calls=%d want=1", got)
+		}
+		if got := f.callCount("object:/download"); got != 1 {
+			t.Fatalf("realname object calls=%d want=1", got)
+		}
+	})
+
+	for _, tc := range []struct {
+		name, linkID string
+	}{
+		{name: "password-protected public link", linkID: fixturePasswordLinkID},
+		{name: "mobile-verified public link", linkID: fixtureMobileLinkID},
+	} {
+		t.Run(tc.name+" stops before documents", func(t *testing.T) {
+			f := newFixture(t)
+			r := newRuntime(t, f)
+			link := f.control.URL + "/link/" + tc.linkID
+			result := runJSON(t, r, []string{"get", "--share", link, t.TempDir(), "top.txt", "--json"}, 3)
+			if result["ok"] != false || result["category"] != "auth" {
+				t.Fatalf("restricted share result=%v", result)
+			}
+			if got := f.callCountPrefix("/api/efast/"); got != 0 {
+				t.Fatalf("restricted share sent %d document requests", got)
+			}
+			if got := f.callCountPrefix("object:"); got != 0 {
+				t.Fatalf("restricted share sent %d object requests", got)
+			}
+		})
+	}
+
+	t.Run("other origin is rejected before network", func(t *testing.T) {
+		f := newFixture(t)
+		r := newRuntime(t, f)
+		result := runJSON(t, r, []string{"ls", "--share", "https://other.invalid/link/FakeOtherHostMarker", "--json"}, 2)
+		if result["ok"] != false || result["category"] != "usage" {
+			t.Fatalf("other-origin result=%v", result)
+		}
+		if got := f.callCountPrefix("/link/"); got != 0 {
+			t.Fatalf("other-origin link made %d control requests", got)
+		}
+	})
+
+	t.Run("cross-origin redirect is not followed", func(t *testing.T) {
+		f := newFixture(t)
+		r := newRuntime(t, f)
+		link := f.control.URL + "/link/" + fixtureRedirectLinkID
+		result := runJSON(t, r, []string{"ls", "--share", link, "--json"}, 5)
+		if result["ok"] != false || result["category"] != "network" {
+			t.Fatalf("cross-origin redirect result=%v", result)
+		}
+		if got := f.callCount("object:/redirect-target"); got != 0 {
+			t.Fatalf("cross-origin redirect target received %d requests", got)
+		}
+		if got := f.callCount("/api/shared-link/v1/links/" + fixtureRedirectLinkID); got != 1 {
+			t.Fatalf("cross-origin redirect metadata calls=%d want=1", got)
+		}
+		if got := f.callCountPrefix("/api/efast/"); got != 0 {
+			t.Fatalf("cross-origin redirect continued with %d document requests", got)
+		}
+	})
+}
+
+func fixtureFolderRoute(id string) string {
+	return "/api/efast/v1/folders/" + id + "/sub_objects"
+}
+
 func infoMode(info os.FileInfo) os.FileMode {
 	if info == nil {
 		return 0
@@ -1527,6 +1909,18 @@ func (f *fixture) callCount(route string) int {
 	return f.calls[route]
 }
 
+func (f *fixture) callCountPrefix(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	total := 0
+	for route, count := range f.calls {
+		if strings.HasPrefix(route, prefix) {
+			total += count
+		}
+	}
+	return total
+}
+
 func (f *fixture) remainingFault(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1670,6 +2064,8 @@ func containsSecretMaterial(data []byte, objectURL string) bool {
 	lower := strings.ToLower(string(data))
 	markers := []string{
 		fixtureAccess, fixtureRefreshedAccess, fixtureRefresh, fixtureSecret, objectURL,
+		fixtureShareToken, fixturePublicLinkID, fixtureRealnameLinkID, fixturePasswordLinkID,
+		fixtureMobileLinkID, fixtureRedirectLinkID,
 		"authorization", "cookie", "signature=", "aws fixture", "fixture-single-generation-",
 		"fixture-part-", "fixture-complete-",
 	}
@@ -1705,7 +2101,11 @@ func runJSON(t *testing.T, r testRuntime, args []string, wantExit int) map[strin
 		t.Fatalf("%v stdout is not exactly one JSON object: %q", args, stdout.String())
 	}
 	combined := stdout.String() + stderr.String()
-	for _, secret := range []string{fixtureAccess, fixtureRefresh, fixtureSecret, r.objectURL, "signature=", "AWS fixture"} {
+	for _, secret := range []string{
+		fixtureAccess, fixtureRefresh, fixtureSecret, fixtureShareToken, fixturePublicLinkID,
+		fixtureRealnameLinkID, fixturePasswordLinkID, fixtureMobileLinkID, fixtureRedirectLinkID,
+		r.objectURL, "signature=", "AWS fixture",
+	} {
 		if strings.Contains(combined, secret) {
 			t.Fatalf("%v leaked %q: stdout=%q stderr=%q", args, secret, stdout.String(), stderr.String())
 		}
@@ -1768,6 +2168,43 @@ type testRuntime struct {
 	objectURL string
 }
 
+type fixtureShareSession struct{ session *sharelink.Session }
+
+func (s fixtureShareSession) Root() cli.ShareEntry {
+	return fixtureShareEntry(s.session.Root())
+}
+
+func (s fixtureShareSession) List(ctx context.Context, relativeDir string) ([]cli.ShareEntry, error) {
+	entries, err := s.session.List(ctx, relativeDir)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]cli.ShareEntry, len(entries))
+	for index, entry := range entries {
+		result[index] = fixtureShareEntry(entry)
+	}
+	return result, nil
+}
+
+func (s fixtureShareSession) Download(ctx context.Context, relativeFiles []string, localDir string, overwrite bool, progress upload.Progress) ([]cli.ShareGetResult, error) {
+	downloads, err := s.session.Download(ctx, relativeFiles, localDir, overwrite, progress)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]cli.ShareGetResult, len(downloads))
+	for index, item := range downloads {
+		result[index] = cli.ShareGetResult{
+			SharePath: item.Entry.Path, Revision: item.Result.Revision,
+			LocalPath: item.Result.LocalPath, Size: item.Result.Size,
+		}
+	}
+	return result, nil
+}
+
+func fixtureShareEntry(entry sharelink.Entry) cli.ShareEntry {
+	return cli.ShareEntry{Name: entry.Name, SharePath: entry.Path, Type: entry.Type, Size: entry.Size}
+}
+
 func newRuntime(t *testing.T, f *fixture) testRuntime {
 	t.Helper()
 	root := t.TempDir()
@@ -1810,6 +2247,10 @@ func newRuntime(t *testing.T, f *fixture) testRuntime {
 	authorizer.CallbackTimeout = 5 * time.Second
 	manager := &auth.Manager{Store: store, OAuth: oauthClient, Authorizer: authorizer, Now: func() time.Time { return fixtureNow }}
 	api := anyshare.NewClient(f.control.URL, httpClient, manager)
+	shareOpener, err := sharelink.NewOpener(f.control.URL, httpClient, api)
+	if err != nil {
+		t.Fatalf("construct shared-link opener: %v", err)
+	}
 	remoteService := remote.NewService(api)
 	uploader := upload.NewUploader(f.control.URL, api, remoteService, upload.NewStateStore(paths.UploadStateDir), 4)
 	uploader.Now = func() time.Time { return fixtureNow }
@@ -1869,6 +2310,13 @@ func newRuntime(t *testing.T, f *fixture) testRuntime {
 				return cli.GetResult{}, err
 			}
 			return cli.GetResult{RemotePath: item.Path, RemoteID: result.RemoteID, Revision: result.Revision, LocalPath: result.LocalPath, Size: result.Size}, nil
+		},
+		OpenShare: func(ctx context.Context, rawLink string) (cli.ShareSession, error) {
+			session, err := shareOpener.Open(ctx, rawLink)
+			if err != nil {
+				return nil, err
+			}
+			return fixtureShareSession{session: session}, nil
 		},
 		Delete: func(ctx context.Context, remotePath string, recursive bool) (cli.DeleteResult, error) {
 			result, err := remoteService.Delete(ctx, remotePath, recursive)

@@ -258,8 +258,8 @@ printf '%s\n' \
 	'Recommends: xdg-utils' \
 	'Description: lightweight command-line client for PKU NetDisk' \
 	' A static Linux amd64 command for per-user OAuth login, remote listing,' \
-	' directory creation, resumable uploads, downloads, and recycle-bin deletion' \
-	' on the PKU AnyShare deployment.' \
+	' directory creation, resumable uploads, personal and shared-link downloads,' \
+	' and recycle-bin deletion on the PKU AnyShare deployment.' \
 	>"$deb_stage/DEBIAN/control"
 printf '%s\n' '/etc/pku-drive-cli/object-pin.json' >"$deb_stage/DEBIAN/conffiles"
 (

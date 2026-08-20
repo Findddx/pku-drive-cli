@@ -16,6 +16,7 @@ import (
 
 	"github.com/Findddx/pku-drive-cli/internal/apperr"
 	"github.com/Findddx/pku-drive-cli/internal/output"
+	"github.com/Findddx/pku-drive-cli/internal/picker"
 	"github.com/Findddx/pku-drive-cli/internal/version"
 )
 
@@ -48,7 +49,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		allowed["overwrite"], allowed["quiet"] = true, true
 	}
 	if command == "get" {
-		allowed["overwrite"], allowed["quiet"] = true, true
+		allowed["overwrite"], allowed["quiet"], allowed["share"] = true, true, true
+	}
+	if command == "ls" {
+		allowed["share"] = true
 	}
 	if command == "rm" {
 		allowed["recursive"] = true
@@ -64,7 +68,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var flagOutput bytes.Buffer
 	flags.SetOutput(&flagOutput)
 	jsonMode := flags.Bool("json", false, "emit JSON")
-	var parents, overwrite, quiet, recursive, localOnly, pasteCallback *bool
+	var parents, overwrite, quiet, recursive, localOnly, pasteCallback, shareMode *bool
 	if command == "login" {
 		pasteCallback = flags.Bool("paste-callback", false, "paste the browser callback URL")
 	}
@@ -78,6 +82,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if command == "get" {
 		overwrite = flags.Bool("overwrite", false, "overwrite existing file")
 		quiet = flags.Bool("quiet", false, "suppress progress")
+		shareMode = flags.Bool("share", false, "download from a shared link")
+	}
+	if command == "ls" {
+		shareMode = flags.Bool("share", false, "list a shared link")
 	}
 	if command == "rm" {
 		recursive = flags.Bool("recursive", false, "delete a directory tree")
@@ -93,7 +101,8 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 	renderer := output.NewRenderer(stdout, stderr, *jsonMode)
 	positionals := flags.Args()
-	if err := validateArity(command, positionals); err != nil {
+	isShare := shareMode != nil && *shareMode
+	if err := validateArity(command, positionals, isShare); err != nil {
 		return renderError(renderer, err)
 	}
 
@@ -135,11 +144,14 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			fields := structFields(result)
 			human := "Not logged in."
 			if result.LoggedIn {
-				human = fmt.Sprintf("Logged in as %s on %s.", result.Account, result.Server)
+				human = fmt.Sprintf("Logged in as %s on %s.", output.TerminalText(result.Account), output.TerminalText(result.Server))
 			}
 			return renderSuccess(renderer, command, fields, human)
 		}
 	case "ls":
+		if isShare {
+			return runShareList(commandCtx, renderer, deps, positionals)
+		}
 		path := "/"
 		if len(positionals) == 1 {
 			path = positionals[0]
@@ -162,7 +174,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			})
 			lines := make([]string, len(entries))
 			for i, entry := range entries {
-				lines[i] = fmt.Sprintf("%s\t%s\t%d", entry.Type, entry.RemotePath, entry.Size)
+				lines[i] = fmt.Sprintf("%s\t%s\t%d", output.TerminalText(entry.Type), output.TerminalText(entry.RemotePath), entry.Size)
 			}
 			return renderSuccess(renderer, command, map[string]any{"entries": entries}, strings.Join(lines, "\n"))
 		}
@@ -174,7 +186,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			result, err = deps.Mkdir(commandCtx, positionals[0], *parents)
 		}
 		if err == nil {
-			return renderSuccess(renderer, command, structFields(result), "Directory ready: "+result.RemotePath)
+			return renderSuccess(renderer, command, structFields(result), "Directory ready: "+output.TerminalText(result.RemotePath))
 		}
 	case "put":
 		var result PutResult
@@ -186,10 +198,13 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 		if err == nil {
 			progress.Finished()
-			return renderSuccess(renderer, command, structFields(result), "Uploaded: "+result.RemotePath)
+			return renderSuccess(renderer, command, structFields(result), "Uploaded: "+output.TerminalText(result.RemotePath))
 		}
 		output.AbortProgress(progress)
 	case "get":
+		if isShare {
+			return runShareGet(commandCtx, renderer, stdin, stderr, deps, positionals, *overwrite, *quiet, *jsonMode)
+		}
 		var result GetResult
 		progress := output.NewDownloadProgress(stderr, *quiet, interactiveWriter(stderr), time.Now)
 		if deps.Get == nil {
@@ -199,7 +214,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		}
 		if err == nil {
 			progress.Finished()
-			return renderSuccess(renderer, command, structFields(result), "Downloaded: "+result.LocalPath)
+			return renderSuccess(renderer, command, structFields(result), "Downloaded: "+output.TerminalText(result.LocalPath))
 		}
 		output.AbortProgress(progress)
 	case "rm":
@@ -210,9 +225,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			result, err = deps.Delete(commandCtx, positionals[0], *recursive)
 		}
 		if err == nil {
-			human := "Moved to recycle bin: " + result.RemotePath
+			human := "Moved to recycle bin: " + output.TerminalText(result.RemotePath)
 			if result.PendingReview {
-				human = "Deletion submitted for review: " + result.RemotePath
+				human = "Deletion submitted for review: " + output.TerminalText(result.RemotePath)
 			}
 			return renderSuccess(renderer, command, structFields(result), human)
 		}
@@ -283,19 +298,157 @@ func requestedJSON(args []string) bool {
 	return false
 }
 
-func validateArity(command string, args []string) error {
+func runShareList(ctx context.Context, renderer *output.Renderer, deps Dependencies, positionals []string) int {
+	if deps.OpenShare == nil {
+		return renderError(renderer, localError("share dependency unavailable"))
+	}
+	session, err := deps.OpenShare(ctx, positionals[0])
+	if err != nil {
+		return renderError(renderer, err)
+	}
+	root := session.Root()
+	var entries []ShareEntry
+	if root.Type == "file" {
+		if len(positionals) != 1 {
+			return renderError(renderer, usageError("a single-file share has no directory to list"))
+		}
+		entries = []ShareEntry{root}
+	} else {
+		directory := ""
+		if len(positionals) == 2 {
+			directory = positionals[1]
+		}
+		entries, err = session.List(ctx, directory)
+		if err != nil {
+			return renderError(renderer, err)
+		}
+	}
+	if entries == nil {
+		entries = make([]ShareEntry, 0)
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].SharePath == entries[j].SharePath {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries[i].SharePath < entries[j].SharePath
+	})
+	lines := make([]string, len(entries))
+	for index, entry := range entries {
+		lines[index] = fmt.Sprintf("%s\t%s\t%d", output.TerminalText(entry.Type), output.TerminalText(entry.SharePath), entry.Size)
+	}
+	return renderSuccess(renderer, "ls", map[string]any{"source": "share", "entries": entries}, strings.Join(lines, "\n"))
+}
+
+func runShareGet(ctx context.Context, renderer *output.Renderer, stdin io.Reader, stderr io.Writer, deps Dependencies, positionals []string, overwrite, quiet, jsonMode bool) int {
+	if deps.OpenShare == nil {
+		return renderError(renderer, localError("share dependency unavailable"))
+	}
+	session, err := deps.OpenShare(ctx, positionals[0])
+	if err != nil {
+		return renderError(renderer, err)
+	}
+	root := session.Root()
+	paths := append([]string(nil), positionals[2:]...)
+	if root.Type == "file" {
+		if len(paths) != 0 {
+			return renderError(renderer, usageError("a single-file share does not accept file selections"))
+		}
+		if root.SharePath == "" {
+			return renderError(renderer, localError("share file path unavailable"))
+		}
+		paths = []string{root.SharePath}
+	} else if len(paths) == 0 {
+		if jsonMode {
+			return renderError(renderer, usageError("shared file paths are required with --json"))
+		}
+		inputFile, inputOK := stdin.(*os.File)
+		outputFile, outputOK := stderr.(*os.File)
+		if !inputOK || !outputOK {
+			return renderError(renderer, usageError("interactive share selection requires a terminal; provide file paths explicitly"))
+		}
+		selected, selectErr := picker.Run(ctx, sharePickerSource{session: session}, picker.Options{Input: inputFile, Output: outputFile, Title: "选择要下载的分享文件"})
+		if selectErr != nil {
+			if errors.Is(selectErr, picker.ErrCanceled) || errors.Is(selectErr, context.Canceled) || errors.Is(selectErr, context.DeadlineExceeded) {
+				return renderError(renderer, apperr.Wrap(apperr.Interrupted, "get", "interrupted", selectErr))
+			}
+			if errors.Is(selectErr, picker.ErrNotTerminal) {
+				return renderError(renderer, usageError("interactive share selection requires a terminal; provide file paths explicitly"))
+			}
+			return renderError(renderer, preserveCLIError("select shared files", selectErr))
+		}
+		if len(selected) == 0 {
+			return renderError(renderer, usageError("no shared files selected"))
+		}
+		paths = make([]string, len(selected))
+		for index, entry := range selected {
+			paths[index] = entry.Path
+		}
+	}
+
+	progress := output.NewDownloadProgress(stderr, quiet, interactiveWriter(stderr), time.Now)
+	results, err := session.Download(ctx, paths, positionals[1], overwrite, progress)
+	if err != nil {
+		output.AbortProgress(progress)
+		return renderError(renderer, err)
+	}
+	progress.Finished()
+	if results == nil {
+		results = make([]ShareGetResult, 0)
+	}
+	lines := make([]string, len(results))
+	for index, result := range results {
+		lines[index] = "Downloaded: " + output.TerminalText(result.LocalPath)
+	}
+	return renderSuccess(renderer, "get", map[string]any{"source": "share", "downloads": results}, strings.Join(lines, "\n"))
+}
+
+type sharePickerSource struct{ session ShareSession }
+
+func (source sharePickerSource) List(ctx context.Context, relativeDir string) ([]picker.Entry, error) {
+	entries, err := source.session.List(ctx, relativeDir)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]picker.Entry, len(entries))
+	for index, entry := range entries {
+		entryType := picker.EntryFile
+		if entry.Type == "directory" || entry.Type == "folder" {
+			entryType = picker.EntryDirectory
+		}
+		result[index] = picker.Entry{ID: entry.SharePath, Path: entry.SharePath, Name: entry.Name, Type: entryType, Size: entry.Size}
+	}
+	return result, nil
+}
+
+func preserveCLIError(operation string, err error) error {
+	var appErr *apperr.Error
+	if errors.As(err, &appErr) {
+		return err
+	}
+	return apperr.Wrap(apperr.Local, operation, "local operation failed", err)
+}
+
+func validateArity(command string, args []string, shareMode bool) error {
 	valid := false
 	switch command {
 	case "login", "status", "logout", "version":
 		valid = len(args) == 0
 	case "ls":
-		valid = len(args) <= 1
+		if shareMode {
+			valid = len(args) == 1 || len(args) == 2
+		} else {
+			valid = len(args) <= 1
+		}
 	case "mkdir":
 		valid = len(args) == 1
 	case "put":
 		valid = len(args) == 2
 	case "get":
-		valid = len(args) == 2
+		if shareMode {
+			valid = len(args) >= 2
+		} else {
+			valid = len(args) == 2
+		}
 	case "rm":
 		valid = len(args) == 1
 	}

@@ -53,14 +53,40 @@ type DeleteResult struct {
 	PendingReview bool   `json:"pending_review"`
 }
 
+// ShareEntry is one file or directory visible below a share root. SharePath
+// is relative to that root and never contains the share URL or link ID.
+type ShareEntry struct {
+	Name      string `json:"name"`
+	SharePath string `json:"share_path"`
+	Type      string `json:"type"`
+	Size      int64  `json:"size"`
+}
+
+// ShareGetResult describes one file downloaded from a share link.
+type ShareGetResult struct {
+	SharePath string `json:"share_path"`
+	Revision  string `json:"revision,omitempty"`
+	LocalPath string `json:"local_path"`
+	Size      int64  `json:"size"`
+}
+
+// ShareSession is an already-authorized public or organization-scoped share.
+// Implementations keep all link credentials private and in memory.
+type ShareSession interface {
+	Root() ShareEntry
+	List(context.Context, string) ([]ShareEntry, error)
+	Download(context.Context, []string, string, bool, upload.Progress) ([]ShareGetResult, error)
+}
+
 // Dependencies contains the external command operations.
 type Dependencies struct {
-	Login  func(context.Context, io.Reader, io.Writer, bool) error
-	Status func(context.Context) (StatusResult, error)
-	List   func(context.Context, string) ([]ItemResult, error)
-	Mkdir  func(context.Context, string, bool) (ItemResult, error)
-	Put    func(context.Context, string, string, bool, upload.Progress) (PutResult, error)
-	Get    func(context.Context, string, string, bool, upload.Progress) (GetResult, error)
-	Delete func(context.Context, string, bool) (DeleteResult, error)
-	Logout func(context.Context, bool) error
+	Login     func(context.Context, io.Reader, io.Writer, bool) error
+	Status    func(context.Context) (StatusResult, error)
+	List      func(context.Context, string) ([]ItemResult, error)
+	Mkdir     func(context.Context, string, bool) (ItemResult, error)
+	Put       func(context.Context, string, string, bool, upload.Progress) (PutResult, error)
+	Get       func(context.Context, string, string, bool, upload.Progress) (GetResult, error)
+	OpenShare func(context.Context, string) (ShareSession, error)
+	Delete    func(context.Context, string, bool) (DeleteResult, error)
+	Logout    func(context.Context, bool) error
 }

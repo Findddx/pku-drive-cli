@@ -8,12 +8,32 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 type Renderer struct {
 	Stdout io.Writer
 	Stderr io.Writer
 	JSON   bool
+}
+
+// TerminalText preserves ordinary Unicode while rendering terminal control
+// characters as visible escape sequences. Callers use it for remote or local
+// names inserted into otherwise structured human output.
+func TerminalText(value string) string {
+	var clean strings.Builder
+	for _, character := range value {
+		if !unicode.IsControl(character) {
+			clean.WriteRune(character)
+			continue
+		}
+		if character <= 0xff {
+			_, _ = fmt.Fprintf(&clean, `\x%02X`, character)
+		} else {
+			_, _ = fmt.Fprintf(&clean, `\u%04X`, character)
+		}
+	}
+	return clean.String()
 }
 
 func NewRenderer(stdout, stderr io.Writer, jsonMode bool) *Renderer {
@@ -91,7 +111,7 @@ func redactGeneric(value any) any {
 func sensitiveKey(key string) bool {
 	compact := strings.ToLower(key)
 	compact = strings.NewReplacer("_", "", "-", "", " ", "").Replace(compact)
-	if compact == "code" || compact == "state" || compact == "codeverifier" || compact == "errordescription" {
+	if compact == "code" || compact == "state" || compact == "codeverifier" || compact == "errordescription" || compact == "linkid" {
 		return true
 	}
 	if compact == "body" || compact == "error" || compact == "err" || compact == "cause" || strings.HasPrefix(compact, "rawerror") || strings.Contains(compact, "responsebody") || strings.Contains(compact, "responsepayload") {
@@ -113,12 +133,26 @@ func redactURLString(value string) string {
 	if parsed.User != nil {
 		return "[REDACTED URL]"
 	}
+	if containsShareCapability(parsed.Path) || containsShareCapability(parsed.Fragment) {
+		return "[REDACTED URL]"
+	}
 	for key := range parsed.Query() {
 		if sensitiveKey(key) {
 			return "[REDACTED URL]"
 		}
 	}
 	return value
+}
+
+func containsShareCapability(value string) bool {
+	value = strings.TrimPrefix(value, "#")
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	for index := 0; index+1 < len(parts); index++ {
+		if strings.EqualFold(parts[index], "link") && parts[index+1] != "" {
+			return true
+		}
+	}
+	return false
 }
 
 var (
