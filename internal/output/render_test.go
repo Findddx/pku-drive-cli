@@ -94,12 +94,43 @@ func TestRendererHumanStreams(t *testing.T) {
 	}
 }
 
+func TestTerminalTextEscapesTerminalControls(t *testing.T) {
+	input := "报告\t\x1b]8;;https://evil.invalid\a名称\n.tsv\u009b31m"
+	got := output.TerminalText(input)
+	for _, character := range got {
+		if character < 0x20 || character >= 0x7f && character <= 0x9f {
+			t.Fatalf("terminal control U+%04X remained in %q", character, got)
+		}
+	}
+	for _, want := range []string{`\x09`, `\x1B`, `\x07`, `\x0A`, `\x9B`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("TerminalText(%q) = %q, missing %q", input, got, want)
+		}
+	}
+	if !strings.Contains(got, "报告") || !strings.Contains(got, "名称") {
+		t.Fatalf("ordinary Unicode was lost: %q", got)
+	}
+}
+
 func TestRedactMessageRemovesOAuthCallbackParameters(t *testing.T) {
 	message := "callback failed at http://127.0.0.1:43123/callback?code=fake-oauth-code&state=fake-oauth-state&code_verifier=fake-oauth-verifier&error_description=fake-oauth-description"
 	got := output.RedactMessage(message)
 	for _, secret := range []string{"fake-oauth-code", "fake-oauth-state", "fake-oauth-verifier", "fake-oauth-description"} {
 		if strings.Contains(got, secret) {
 			t.Fatalf("OAuth parameter %q leaked in %q", secret, got)
+		}
+	}
+}
+
+func TestRedactMessageRemovesShareCapabilities(t *testing.T) {
+	for _, message := range []string{
+		"share failed at https://disk.pku.edu.cn/link/AA-ShareCapabilityMarker",
+		"legacy share https://disk.pku.edu.cn/anyshare/#/link/AR_ShareCapabilityMarker",
+		"metadata https://disk.pku.edu.cn/api/shared-link/v1/links/value?link_id=ShareCapabilityMarker",
+	} {
+		got := output.RedactMessage(message)
+		if strings.Contains(got, "ShareCapabilityMarker") || strings.Contains(got, "/link/AA-") || strings.Contains(got, "/link/AR_") {
+			t.Fatalf("share capability leaked in %q", got)
 		}
 	}
 }

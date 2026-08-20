@@ -1,7 +1,7 @@
 SHELL := /bin/sh
 
 ifeq ($(origin VERSION),undefined)
-override VERSION := 0.2.0
+override VERSION := 0.3.0
 else
 override VERSION := $(value VERSION)
 endif

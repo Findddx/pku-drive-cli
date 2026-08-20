@@ -62,6 +62,142 @@ func TestGetVerifiesMetadataAndAtomicallyWritesFile(t *testing.T) {
 	assertDirectoryEntries(t, filepath.Dir(destination), filepath.Base(destination))
 }
 
+func TestGetAtCreatesRelativeDirectoriesAndKeepsVerifiedLayout(t *testing.T) {
+	const contents = "nested verified download"
+	item := fileItem(contents)
+	api := &downloadAPIFake{
+		metadata:       item,
+		authorizations: []anyshare.SignedRequest{{Method: "GET", URL: "https://objects.invalid/nested"}},
+		streams:        []streamResult{{stream: anyshare.DownloadStream{Body: io.NopCloser(strings.NewReader(contents)), ContentLength: int64(len(contents))}}},
+	}
+	rootPath := t.TempDir()
+	root, err := download.OpenDestinationRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	result, err := download.NewDownloader(api).GetAt(context.Background(), item, root, "一级目录/数据/file.tsv", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(rootPath, "一级目录", "数据", "file.tsv")
+	if result.LocalPath != want {
+		t.Fatalf("LocalPath = %q, want %q", result.LocalPath, want)
+	}
+	data, err := os.ReadFile(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != contents {
+		t.Fatalf("contents = %q", data)
+	}
+	for _, directory := range []string{filepath.Join(rootPath, "一级目录"), filepath.Join(rootPath, "一级目录", "数据")} {
+		info, err := os.Stat(directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Fatalf("mode(%s) = %o, want 0700", directory, info.Mode().Perm())
+		}
+	}
+	info, err := os.Stat(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("file mode = %o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestGetAtRejectsUnsafeRelativePathsBeforeNetwork(t *testing.T) {
+	item := fileItem("unused")
+	root, err := download.OpenDestinationRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, relative := range []string{"", ".", "../escape", "dir/../escape", "/absolute", "dir//file", "dir/./file", "dir/\x00file"} {
+		t.Run(strings.ReplaceAll(relative, "/", "_"), func(t *testing.T) {
+			api := &downloadAPIFake{metadata: item}
+			_, err := download.NewDownloader(api).GetAt(context.Background(), item, root, relative, false, nil)
+			var appErr *apperr.Error
+			if !errors.As(err, &appErr) || appErr.Category != apperr.Local {
+				t.Fatalf("err = %v, want local", err)
+			}
+			if len(api.authorizationCalls) != 0 {
+				t.Fatalf("network authorization calls = %d", len(api.authorizationCalls))
+			}
+		})
+	}
+}
+
+func TestGetAtRejectsSymlinkDirectoryWithoutWritingOutsideRoot(t *testing.T) {
+	const contents = "must stay inside root"
+	item := fileItem(contents)
+	outside := t.TempDir()
+	rootPath := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(rootPath, "redirect")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := download.OpenDestinationRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	api := &downloadAPIFake{metadata: item}
+
+	_, err = download.NewDownloader(api).GetAt(context.Background(), item, root, "redirect/file.tsv", false, nil)
+	var appErr *apperr.Error
+	if !errors.As(err, &appErr) || appErr.Category != apperr.Local {
+		t.Fatalf("err = %v, want local", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "file.tsv")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside destination err = %v, want not exist", err)
+	}
+	if len(api.authorizationCalls) != 0 {
+		t.Fatalf("network authorization calls = %d", len(api.authorizationCalls))
+	}
+}
+
+func TestDestinationRootStaysBoundWhenPathIsReplaced(t *testing.T) {
+	const contents = "bound directory contents"
+	item := fileItem(contents)
+	api := &downloadAPIFake{
+		metadata:       item,
+		authorizations: []anyshare.SignedRequest{{Method: "GET", URL: "https://objects.invalid/bound"}},
+		streams:        []streamResult{{stream: anyshare.DownloadStream{Body: io.NopCloser(strings.NewReader(contents)), ContentLength: int64(len(contents))}}},
+	}
+	parent := t.TempDir()
+	rootPath := filepath.Join(parent, "downloads")
+	if err := os.Mkdir(rootPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	root, err := download.OpenDestinationRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	heldPath := filepath.Join(parent, "held")
+	if err := os.Rename(rootPath, heldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(rootPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := download.NewDownloader(api).GetAt(context.Background(), item, root, "nested/file.tsv", false, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(heldPath, "nested", "file.tsv"))
+	if err != nil || string(data) != contents {
+		t.Fatalf("held contents = %q err=%v", data, err)
+	}
+	if _, err := os.Stat(filepath.Join(rootPath, "nested", "file.tsv")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement destination err = %v, want not exist", err)
+	}
+}
+
 func TestGetRefusesExistingDestinationWithoutNetwork(t *testing.T) {
 	const original = "keep original"
 	destination := filepath.Join(t.TempDir(), "existing.bin")

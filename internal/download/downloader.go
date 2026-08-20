@@ -59,8 +59,7 @@ func (d *Downloader) Get(ctx context.Context, item anyshare.Item, localPath stri
 	if d == nil || d.API == nil {
 		return Result{}, downloadError(apperr.Local, "configure download", errors.New("missing download dependency"))
 	}
-	docID := itemIdentity(item)
-	if docID == "" || item.Type != "file" || item.Rev == "" || item.Size < 0 {
+	if err := validateDownloadItem(item); err != nil {
 		return Result{}, downloadError(apperr.Remote, "select download", errors.New("remote path is not an exact file revision"))
 	}
 	abs, err := filepath.Abs(localPath)
@@ -71,6 +70,33 @@ func (d *Downloader) Get(ctx context.Context, item anyshare.Item, localPath stri
 	if err != nil {
 		return Result{}, downloadError(apperr.Local, "inspect download destination", err)
 	}
+	return d.getToTarget(ctx, item, abs, target, progress)
+}
+
+// GetAt downloads item below a descriptor-bound destination root. relativePath
+// is a normalized relative file path; missing parent directories are created
+// mode 0700 without following symbolic links.
+func (d *Downloader) GetAt(ctx context.Context, item anyshare.Item, root *DestinationRoot, relativePath string, overwrite bool, progress Progress) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if d == nil || d.API == nil {
+		return Result{}, downloadError(apperr.Local, "configure download", errors.New("missing download dependency"))
+	}
+	if err := validateDownloadItem(item); err != nil {
+		return Result{}, downloadError(apperr.Remote, "select download", errors.New("remote path is not an exact file revision"))
+	}
+	target, displayPath, err := root.openTarget(relativePath, overwrite)
+	if err != nil {
+		return Result{}, downloadError(apperr.Local, "inspect download destination", err)
+	}
+	return d.getToTarget(ctx, item, displayPath, target, progress)
+}
+
+func (d *Downloader) getToTarget(ctx context.Context, item anyshare.Item, displayPath string, target *downloadTarget, progress Progress) (result Result, returnErr error) {
+	if target == nil {
+		return Result{}, downloadError(apperr.Local, "inspect download destination", errors.New("missing download target"))
+	}
 	committed := false
 	defer func() {
 		if closeErr := target.Close(); !committed && returnErr == nil && closeErr != nil {
@@ -79,7 +105,7 @@ func (d *Downloader) Get(ctx context.Context, item anyshare.Item, localPath stri
 		}
 	}()
 
-	metadata, err := d.API.FileMetadata(ctx, docID, item.Rev)
+	metadata, err := d.API.FileMetadata(ctx, itemIdentity(item), item.Rev)
 	if err != nil {
 		return Result{}, classifyDownloadError("read download metadata", err)
 	}
@@ -95,7 +121,7 @@ func (d *Downloader) Get(ctx context.Context, item anyshare.Item, localPath stri
 		saveName = item.Name
 	}
 	if saveName == "" {
-		saveName = filepath.Base(abs)
+		saveName = filepath.Base(displayPath)
 	}
 	stream, err := d.openStream(ctx, metadata, saveName)
 	if err != nil {
@@ -141,7 +167,14 @@ func (d *Downloader) Get(ctx context.Context, item anyshare.Item, localPath stri
 	if progress != nil {
 		progress.Finished()
 	}
-	return Result{LocalPath: abs, RemoteID: itemIdentity(metadata), Revision: metadata.Rev, Size: metadata.Size}, nil
+	return Result{LocalPath: displayPath, RemoteID: itemIdentity(metadata), Revision: metadata.Rev, Size: metadata.Size}, nil
+}
+
+func validateDownloadItem(item anyshare.Item) error {
+	if itemIdentity(item) == "" || item.Type != "file" || item.Rev == "" || item.Size < 0 {
+		return errors.New("remote path is not an exact file revision")
+	}
+	return nil
 }
 
 func (d *Downloader) openStream(ctx context.Context, item anyshare.Item, saveName string) (anyshare.DownloadStream, error) {
