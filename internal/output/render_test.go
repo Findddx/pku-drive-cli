@@ -212,3 +212,61 @@ func TestRendererJSONFailureRedactsEveryAbsoluteURL(t *testing.T) {
 		}
 	}
 }
+
+func TestRendererFailureFieldsJSONShapeAndRedaction(t *testing.T) {
+	// Mutation caught: emitting structured failure fields unredacted, letting
+	// them override the envelope keys, or diverging from the Failure contract.
+	var stdout, stderr bytes.Buffer
+	renderer := output.NewRenderer(&stdout, &stderr, true)
+	err := renderer.FailureFields("network", "download stopped after 1 completed file(s); completed files remain in destination", map[string]any{
+		"downloads": []any{map[string]any{
+			"remote_path": "/d/a.csv", "remote_id": "doc-a", "local_path": "/dst/a.csv",
+			"access_token": "fake-field-token", "size": 5,
+		}},
+		"skipped":  []any{map[string]any{"path": "b.csv", "reason": "exists"}},
+		"ok":       true, // must not override the envelope
+		"category": "usage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["ok"] != false || got["category"] != "network" {
+		t.Fatalf("envelope=%v", got)
+	}
+	downloads := got["downloads"].([]any)
+	if len(downloads) != 1 {
+		t.Fatalf("downloads=%v", got["downloads"])
+	}
+	entry := downloads[0].(map[string]any)
+	if entry["remote_path"] != "/d/a.csv" || entry["access_token"] != "[REDACTED]" {
+		t.Fatalf("entry=%v", entry)
+	}
+	skipped := got["skipped"].([]any)
+	if len(skipped) != 1 || skipped[0].(map[string]any)["reason"] != "exists" {
+		t.Fatalf("skipped=%v", skipped)
+	}
+	if strings.Contains(stdout.String(), "fake-field-token") {
+		t.Fatalf("secret leaked: %q", stdout.String())
+	}
+}
+
+func TestRendererFailureFieldsHumanMatchesFailure(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	renderer := output.NewRenderer(&stdout, &stderr, false)
+	if err := renderer.FailureFields("local", "local operation failed: token=fake-secret", map[string]any{"downloads": []any{}}); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout=%q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "local operation failed") || strings.Contains(stderr.String(), "fake-secret") {
+		t.Fatalf("stderr=%q", stderr.String())
+	}
+}

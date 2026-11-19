@@ -76,6 +76,8 @@ pku-drive login --paste-callback
 | 创建目录 | `pku-drive mkdir '网盘目录' [--parents]` |
 | 上传文件 | `pku-drive put 本地文件 '网盘文件或目录'` |
 | 下载文件 | `pku-drive get '网盘文件' 本地文件或目录` |
+| 上传目录 | `pku-drive put --recursive 本地目录 '网盘目录' [--jobs=N]` |
+| 下载目录 | `pku-drive get --recursive '网盘目录' 本地目录 [--jobs=N]` |
 | 浏览分享链接 | `pku-drive ls --share 分享链接 [分享内目录]` |
 | 下载分享文件 | `pku-drive get --share 分享链接 本地目录 [分享内文件...]` |
 | 删除 | `pku-drive rm '网盘文件或目录' [--recursive]` |
@@ -138,6 +140,55 @@ pku-drive rm '/个人文档/课题/report.csv'
 
 # 删除目录及其中内容
 pku-drive rm '/个人文档/课题/旧数据' --recursive
+```
+
+### 递归下载/上传目录
+
+`get --recursive` 与 `put --recursive` 按整棵目录树传输。布局是 **rsync 式**：源目录的直接
+子项落在目标的顶层，不创建以源目录名命名的子目录：
+
+```bash
+mkdir -p ./dst
+pku-drive get --recursive '/个人文档/课题' ./dst
+# 产生 ./dst/report.csv、./dst/数据/a.csv（而不是 ./dst/课题/...）
+
+pku-drive put --recursive ./backup '/个人文档/备份'
+# 网盘上产生 /个人文档/backup 的每个文件（而不是 /个人文档/备份/backup/...）
+```
+
+两方向都可以加 `--jobs=N`（1..64，默认 1 即严格串行）并发传输单个文件：
+
+```bash
+pku-drive get --recursive '/个人文档/课题' ./dst --jobs=4
+pku-drive put --recursive ./backup '/个人文档/备份' --jobs=4 --json
+```
+
+`--jobs` 是带值 flag，遵循 Go `flag` 包的标准行为：`--jobs=4` 在任何位置都可靠；
+`--jobs 4`（空格形式）只有当值紧跟在 flag 后面时才有效——若 flag 写在位置参数之后
+（例如 `get --recursive '/a/b' ./dst --jobs 4`），重排逻辑会把紧跟的 `'/a/b'` 当作
+`--jobs` 的值导致解析失败退出 2。建议统一使用 `--jobs=4` 等号写法。
+
+不对称的目标目录约定（与单文件命令一致）：
+
+- **get 的本地目录必须已存在**：工具全程以不跟随符号链接的安全方式绑定目标目录，
+  不会替你创建本地路径（`O_NOFOLLOW` 安全姿态）。
+- **put 的远端目录不存在时自动逐级创建**：复用 `mkdir --parents` 的创建与冲突和解
+  纪律，绝不重复发送非幂等创建请求。
+
+已存在同名文件默认**跳过**并计入 `skipped`（原因 `exists`），加 `--overwrite` 才覆盖。
+这与单文件 get/put 无 `--overwrite` 时直接报错不同：跳过语义让中断后**重跑同一命令即可
+续传**——已完成的文件自动跳过，只有剩余文件继续传输。上传侧的本地符号链接同样跳过
+（原因 `symlink`，不跟随）；本地空目录不会在网盘创建。整库路径（如 `'/个人文档'`）
+允许递归；虚拟根 `'/'` 拒绝（用法错误）。
+
+部分失败契约：批内在**第一个文件错误**处停止，退出码等于该错误的类别（remote=4 /
+network=5 / local=6 / integrity=7 / interrupted=130）。错误消息包含已完成数量，
+`--json` 失败体额外携带已完成（`downloads`/`uploads`）与跳过（`skipped`）列表，
+脚本可据此增量重跑：
+
+```jsonc
+{"ok":false,"category":"network","message":"download stopped after 1 completed file(s); ...",
+ "downloads":[...],"skipped":[]}
 ```
 
 ## 下载分享链接
