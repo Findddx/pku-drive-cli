@@ -35,6 +35,7 @@ import (
 	"github.com/Findddx/pku-drive-cli/internal/oauth"
 	"github.com/Findddx/pku-drive-cli/internal/remote"
 	"github.com/Findddx/pku-drive-cli/internal/sharelink"
+	"github.com/Findddx/pku-drive-cli/internal/transfer"
 	"github.com/Findddx/pku-drive-cli/internal/upload"
 	"github.com/Findddx/pku-drive-cli/internal/version"
 )
@@ -77,6 +78,7 @@ type fixture struct {
 	nodes           map[string]*fixtureNode
 	pending         map[string]*pendingUpload
 	faults          map[string]int
+	failDownloadOn  map[string]int
 	partOK          map[int]bool
 	partTry         map[int]int
 	gateTwo         bool
@@ -135,7 +137,7 @@ func newFixture(t *testing.T) *fixture {
 		t: t, parts: map[int][]byte{}, calls: map[string]int{}, instant: map[int64][]byte{},
 		expectedByName: map[string]expectedContent{}, expectedBySlice: map[string]expectedContent{},
 		puts: map[string]int{}, files: map[string][]byte{}, nodes: map[string]*fixtureNode{}, pending: map[string]*pendingUpload{},
-		faults: map[string]int{}, partOK: map[int]bool{}, partTry: map[int]int{}, twoDone: make(chan struct{}),
+		faults: map[string]int{}, failDownloadOn: map[string]int{}, partOK: map[int]bool{}, partTry: map[int]int{}, twoDone: make(chan struct{}),
 		activeAccess: fixtureAccess,
 	}
 	f.nodes["gns://library"] = &fixtureNode{ID: "gns://library", Name: "个人文档", Type: "directory", Rev: "library-r1", Path: "/个人文档", Size: -1}
@@ -565,6 +567,44 @@ func (f *fixture) beginUpload(w http.ResponseWriter, r *http.Request, multipartM
 	if !decodeFixtureJSON(f, w, r, &request) {
 		return
 	}
+	if request.EditedRev != "" {
+		// Overwrite begin: the object identity stays the file's own docid and
+		// the new revision must differ from the edited baseline.
+		if request.DocID == "" || request.Name != "" || request.OnDup != 0 || request.Length < 0 || (!multipartMode && request.ReqMethod != http.MethodPut) || (multipartMode && request.ReqMethod != "") {
+			f.t.Errorf("begin overwrite multipart=%v request=%+v", multipartMode, request)
+			http.Error(w, "bad overwrite begin", http.StatusBadRequest)
+			return
+		}
+		f.mu.Lock()
+		node := f.nodes[request.DocID]
+		if node == nil || node.Type != "file" || node.Rev != request.EditedRev {
+			f.mu.Unlock()
+			http.Error(w, "overwrite target not found", http.StatusNotFound)
+			return
+		}
+		expected, exists := f.expectedByName[node.Name]
+		if !exists || expected.Size != request.Length || expected.ClientMtimeUS != request.ClientMtime {
+			f.mu.Unlock()
+			http.Error(w, "upload evidence mismatch", http.StatusBadRequest)
+			return
+		}
+		f.seq++
+		rev := fmt.Sprintf("upload-r%d", f.seq)
+		uploadID := ""
+		if multipartMode {
+			uploadID = fmt.Sprintf("multipart-%d", f.seq)
+		}
+		f.pending[request.DocID] = &pendingUpload{DocID: request.DocID, ParentID: node.ParentID, Name: node.Name, Rev: rev, UploadID: uploadID, Size: request.Length, ClientMtimeUS: request.ClientMtime, Parts: map[int][]byte{}, ETags: map[int]string{}, SingleGeneration: 1, MD5: expected.MD5, SliceMD5: expected.SliceMD5, CRC32: expected.CRC32}
+		f.mu.Unlock()
+		response := map[string]any{"docid": request.DocID, "rev": rev, "name": ""}
+		if multipartMode {
+			response["uploadid"] = uploadID
+		} else {
+			response["authrequest"] = []string{http.MethodPut, f.objects.URL + "/single?doc=" + url.QueryEscape(request.DocID) + "&signature=single-generation-1", "Authorization: AWS fixture-single-generation-1"}
+		}
+		writeJSON(w, response)
+		return
+	}
 	if request.DocID == "" || request.Name == "" || request.Length < 0 || request.OnDup != 1 || request.EditedRev != "" || (!multipartMode && request.ReqMethod != http.MethodPut) || (multipartMode && request.ReqMethod != "") {
 		f.t.Errorf("begin multipart=%v request=%+v", multipartMode, request)
 		http.Error(w, "bad begin", http.StatusBadRequest)
@@ -828,6 +868,13 @@ func (f *fixture) authorizeDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad download authorization", http.StatusBadRequest)
 		return
 	}
+	if f.consumeFailDownload(request.DocID) {
+		// Dropping the connection (not 503): a transport error stays Network
+		// through httpx requestError classification, while a 503 exhausts
+		// retries and surfaces as Remote.
+		dropHTTPConnection(f, w)
+		return
+	}
 	signedURL := f.objects.URL + "/download?doc=" + url.QueryEscape(node.ID) + "&rev=" + url.QueryEscape(node.Rev) + "&signature=fixture-download"
 	writeJSON(w, map[string]any{"authrequest": []string{
 		http.MethodGet,
@@ -835,6 +882,19 @@ func (f *fixture) authorizeDownload(w http.ResponseWriter, r *http.Request) {
 		"Authorization: AWS must-not-leave-control-plane",
 		"x-as-userid: fixture-user",
 	}})
+}
+
+// consumeFailDownload decrements the per-docID drop counter used to inject a
+// Network-class download failure at an exact tree position.
+func (f *fixture) consumeFailDownload(docID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	remaining := f.failDownloadOn[docID]
+	if remaining <= 0 {
+		return false
+	}
+	f.failDownloadOn[docID] = remaining - 1
+	return true
 }
 
 func (f *fixture) deleteFile(w http.ResponseWriter, r *http.Request) {
@@ -1903,6 +1963,50 @@ func (f *fixture) setFault(name string, count int) {
 	f.mu.Unlock()
 }
 
+// addDir registers a directory node for sub_objects listing and mkdir
+// reconciliation.
+func (f *fixture) addDir(parentID, name string) *fixtureNode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parent := f.nodes[parentID]
+	if parent == nil {
+		f.t.Fatalf("addDir: unknown parent %s", parentID)
+	}
+	f.seq++
+	node := &fixtureNode{
+		ID: fmt.Sprintf("gns://dir-%d", f.seq), ParentID: parentID, Name: name, Type: "directory",
+		Rev: fmt.Sprintf("dir-r%d", f.seq), Path: strings.TrimRight(parent.Path, "/") + "/" + name, Size: -1,
+	}
+	f.nodes[node.ID] = node
+	return node
+}
+
+// addFile registers a file node with its content for listing and download.
+func (f *fixture) addFile(parentID, name string, data []byte) *fixtureNode {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parent := f.nodes[parentID]
+	if parent == nil {
+		f.t.Fatalf("addFile: unknown parent %s", parentID)
+	}
+	evidence := contentEvidence(name, data, fixtureNow.UnixNano()/1000, false)
+	f.seq++
+	node := &fixtureNode{
+		ID: fmt.Sprintf("gns://file-%d", f.seq), ParentID: parentID, Name: name, Type: "file",
+		Rev: fmt.Sprintf("file-r%d", f.seq), Path: strings.TrimRight(parent.Path, "/") + "/" + name,
+		Size: evidence.Size, MD5: evidence.MD5, SliceMD5: evidence.SliceMD5, CRC32: evidence.CRC32,
+	}
+	f.nodes[node.ID] = node
+	f.files[node.Path] = append([]byte(nil), data...)
+	return node
+}
+
+func (f *fixture) setFailDownload(docID string, count int) {
+	f.mu.Lock()
+	f.failDownloadOn[docID] = count
+	f.mu.Unlock()
+}
+
 func (f *fixture) callCount(route string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -2311,6 +2415,44 @@ func newRuntime(t *testing.T, f *fixture) testRuntime {
 			}
 			return cli.GetResult{RemotePath: item.Path, RemoteID: result.RemoteID, Revision: result.Revision, LocalPath: result.LocalPath, Size: result.Size}, nil
 		},
+		GetTree: func(ctx context.Context, remotePath, localDir string, overwrite bool, jobs int, progress upload.Progress) (cli.TreeGetResult, error) {
+			report, err := transfer.DownloadTree(ctx, remoteService, downloader, remotePath, localDir, transfer.Options{Overwrite: overwrite, Jobs: jobs}, progress)
+			return cli.TreeGetResult{
+				Downloads: func() []cli.GetResult {
+					results := make([]cli.GetResult, len(report.Completed))
+					for i, item := range report.Completed {
+						results[i] = cli.GetResult{RemotePath: item.RemotePath, RemoteID: item.Result.RemoteID, Revision: item.Result.Revision, LocalPath: item.Result.LocalPath, Size: item.Result.Size}
+					}
+					return results
+				}(),
+				Skipped: func() []cli.SkippedItem {
+					results := make([]cli.SkippedItem, len(report.Skipped))
+					for i, item := range report.Skipped {
+						results[i] = cli.SkippedItem{Path: item.Path, Reason: string(item.Reason)}
+					}
+					return results
+				}(),
+			}, err
+		},
+		PutTree: func(ctx context.Context, localDir, remotePath string, overwrite bool, jobs int, progress upload.Progress) (cli.TreePutResult, error) {
+			report, err := transfer.UploadTree(ctx, remoteService, uploader, localDir, remotePath, transfer.Options{Overwrite: overwrite, Jobs: jobs}, progress)
+			return cli.TreePutResult{
+				Uploads: func() []cli.PutResult {
+					results := make([]cli.PutResult, len(report.Completed))
+					for i, item := range report.Completed {
+						results[i] = cli.PutResult{RemotePath: item.Result.RemotePath, RemoteID: item.Result.RemoteID, Revision: item.Result.Revision, Size: item.Result.Size, Resumed: item.Result.Resumed, Instant: item.Result.Instant, Multipart: item.Result.Multipart, PartsTotal: item.Result.PartsTotal, PartsResumed: item.Result.PartsResumed, PartsUploaded: item.Result.PartsUploaded}
+					}
+					return results
+				}(),
+				Skipped: func() []cli.SkippedItem {
+					results := make([]cli.SkippedItem, len(report.Skipped))
+					for i, item := range report.Skipped {
+						results[i] = cli.SkippedItem{Path: item.Path, Reason: string(item.Reason)}
+					}
+					return results
+				}(),
+			}, err
+		},
 		OpenShare: func(ctx context.Context, rawLink string) (cli.ShareSession, error) {
 			session, err := shareOpener.Open(ctx, rawLink)
 			if err != nil {
@@ -2331,4 +2473,302 @@ func newRuntime(t *testing.T, f *fixture) testRuntime {
 		Logout: manager.Logout,
 	}
 	return testRuntime{deps: deps, paths: paths, objectURL: f.objects.URL}
+}
+
+// --- Recursive directory transfer scenarios (plan §5.3) ---
+
+// treeDownloadFixture builds '/个人文档/树' with two levels and three files
+// (including a Chinese name) and returns the fixture runtime.
+func treeDownloadFixture(t *testing.T) (*fixture, testRuntime, *fixtureNode) {
+	t.Helper()
+	f := newFixture(t)
+	r := newRuntime(t, f)
+	loginCLI(t, r)
+	tree := f.addDir("gns://library", "树")
+	inner := f.addDir(tree.ID, "数据")
+	f.addFile(tree.ID, "报告.csv", []byte("树级报告内容\n"))
+	f.addFile(inner.ID, "样本.csv", []byte("样本数据 payload\n"))
+	f.addFile(tree.ID, "top.txt", []byte("top level payload\n"))
+	return f, r, tree
+}
+
+func TestCLITreeGet(t *testing.T) {
+	_, r, tree := treeDownloadFixture(t)
+	dst := t.TempDir()
+	result := runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--json"}, 0)
+	downloads, ok := result["downloads"].([]any)
+	if !ok || len(downloads) != 3 {
+		t.Fatalf("downloads=%T %v", result["downloads"], result["downloads"])
+	}
+	skipped := result["skipped"].([]any)
+	if len(skipped) != 0 {
+		t.Fatalf("skipped=%v", skipped)
+	}
+	// rsync-style layout: the remote root's direct children land at the top
+	// level of dst (no root-named directory).
+	want := map[string][]byte{
+		"报告.csv":    []byte("树级报告内容\n"),
+		"top.txt":   []byte("top level payload\n"),
+		"数据/样本.csv": []byte("样本数据 payload\n"),
+	}
+	for relative, payload := range want {
+		got, err := os.ReadFile(filepath.Join(dst, filepath.FromSlash(relative)))
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("local %s bytes=%q err=%v", relative, got, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dst, "树")); !os.IsNotExist(err) {
+		t.Fatalf("root-named directory must not exist: %v", err)
+	}
+	// Each entry carries full identity.
+	for _, raw := range downloads {
+		entry := raw.(map[string]any)
+		if entry["remote_path"] == "" || entry["remote_id"] == "" || entry["revision"] == "" || entry["local_path"] == "" {
+			t.Fatalf("entry=%v", entry)
+		}
+	}
+}
+
+func TestCLITreeGetLibraryRoot(t *testing.T) {
+	_, r, _ := treeDownloadFixture(t)
+	dst := t.TempDir()
+	result := runJSON(t, r, []string{"get", "--recursive", "/个人文档", dst, "--json"}, 0)
+	downloads := result["downloads"].([]any)
+	if len(downloads) != 3 {
+		t.Fatalf("downloads=%d (entry library must be walkable)", len(downloads))
+	}
+	for _, raw := range downloads {
+		entry := raw.(map[string]any)
+		if !strings.HasPrefix(entry["remote_path"].(string), "/个人文档/") {
+			t.Fatalf("entry=%v", entry)
+		}
+	}
+}
+
+func TestCLITreeGetSkipAndOverwrite(t *testing.T) {
+	f, r, tree := treeDownloadFixture(t)
+	_ = f
+	dst := t.TempDir()
+	runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--json"}, 0)
+
+	// Re-run without --overwrite: everything skipped, nothing re-downloaded.
+	before := f.callCount("object:/download")
+	rerun := runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--json"}, 0)
+	downloads := rerun["downloads"].([]any)
+	if len(downloads) != 0 {
+		t.Fatalf("downloads=%v", downloads)
+	}
+	skipped := rerun["skipped"].([]any)
+	if len(skipped) != 3 {
+		t.Fatalf("skipped=%v", skipped)
+	}
+	for _, raw := range skipped {
+		if raw.(map[string]any)["reason"] != "exists" {
+			t.Fatalf("skip reason=%v", raw)
+		}
+	}
+	if got := f.callCount("object:/download") - before; got != 0 {
+		t.Fatalf("re-downloaded %d objects without --overwrite", got)
+	}
+
+	// With --overwrite: all three re-downloaded.
+	overwritten := runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--overwrite", "--json"}, 0)
+	downloads = overwritten["downloads"].([]any)
+	if len(downloads) != 3 {
+		t.Fatalf("overwrite downloads=%d", len(downloads))
+	}
+	if got := f.callCount("object:/download") - before; got != 3 {
+		t.Fatalf("object downloads after overwrite=%d want 3", got)
+	}
+}
+
+func TestCLITreeGetPartialFailure(t *testing.T) {
+	f, r, tree := treeDownloadFixture(t)
+	// jobs=1 keeps the order deterministic. Lexical order at the top level is
+	// top.txt ("t" = 0x74) before 报告.csv (CJK bytes > 0x80), so 报告.csv is
+	// the SECOND file: top.txt completes, 报告.csv fails with a dropped
+	// connection.
+	var secondDocID string
+	f.mu.Lock()
+	for _, node := range f.nodes {
+		if node.ParentID == tree.ID && node.Name == "报告.csv" {
+			secondDocID = node.ID
+		}
+	}
+	f.mu.Unlock()
+	if secondDocID == "" {
+		t.Fatal("fixture file not found")
+	}
+	f.setFailDownload(secondDocID, 5) // enough for every retry attempt
+	dst := t.TempDir()
+	result := runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--json"}, 5)
+	if result["ok"] != false || result["category"] != "network" {
+		t.Fatalf("result=%v", result)
+	}
+	downloads := result["downloads"].([]any)
+	if len(downloads) != 1 {
+		t.Fatalf("downloads=%v want exactly the first completed file", downloads)
+	}
+	first := downloads[0].(map[string]any)
+	if first["remote_path"] != tree.Path+"/top.txt" {
+		t.Fatalf("first=%v", first)
+	}
+	// The completed file remains on disk.
+	got, err := os.ReadFile(filepath.Join(dst, "top.txt"))
+	if err != nil || !bytes.Equal(got, []byte("top level payload\n")) {
+		t.Fatalf("completed file bytes=%q err=%v", got, err)
+	}
+}
+
+func TestCLITreeGetVirtualRoot(t *testing.T) {
+	f := newFixture(t)
+	r := newRuntime(t, f)
+	loginCLI(t, r)
+	result := runJSON(t, r, []string{"get", "--recursive", "/", t.TempDir(), "--json"}, 2)
+	if result["ok"] != false || result["category"] != "usage" {
+		t.Fatalf("result=%v", result)
+	}
+	// The rejection happens before any document API request.
+	if got := f.callCountPrefix("/api/efast/"); got != 0 {
+		t.Fatalf("virtual root made %d document requests", got)
+	}
+	if got := f.callCountPrefix("object:"); got != 0 {
+		t.Fatalf("virtual root made %d object requests", got)
+	}
+}
+
+func TestCLITreePut(t *testing.T) {
+	f := newFixture(t)
+	r := newRuntime(t, f)
+	loginCLI(t, r)
+
+	src := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(src, "数据"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(src, "空目录"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "报告.bin"), []byte("上传报告 payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "数据", "样本.bin"), []byte("样本上传 payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(src, "报告.bin"), filepath.Join(src, "link.bin")); err != nil {
+		t.Fatal(err)
+	}
+	f.expectFile(t, filepath.Join(src, "报告.bin"), "报告.bin", []byte("上传报告 payload\n"), false)
+	f.expectFile(t, filepath.Join(src, "数据", "样本.bin"), "样本.bin", []byte("样本上传 payload\n"), false)
+
+	result := runJSON(t, r, []string{"put", "--recursive", src, "/个人文档/上传树", "--json"}, 0)
+	uploads := result["uploads"].([]any)
+	if len(uploads) != 2 {
+		t.Fatalf("uploads=%v", uploads)
+	}
+	skipped := result["skipped"].([]any)
+	if len(skipped) != 1 || skipped[0].(map[string]any)["path"] != "link.bin" || skipped[0].(map[string]any)["reason"] != "symlink" {
+		t.Fatalf("skipped=%v", skipped)
+	}
+	// Content verified end-to-end.
+	if got := f.fileBytes("/个人文档/上传树/报告.bin"); !bytes.Equal(got, []byte("上传报告 payload\n")) {
+		t.Fatalf("报告.bin=%q", got)
+	}
+	if got := f.fileBytes("/个人文档/上传树/数据/样本.bin"); !bytes.Equal(got, []byte("样本上传 payload\n")) {
+		t.Fatalf("样本.bin=%q", got)
+	}
+	// Remote tree has no node for the empty local directory.
+	f.mu.Lock()
+	for _, node := range f.nodes {
+		if node.Name == "空目录" {
+			f.mu.Unlock()
+			t.Fatal("empty local directory was created remotely")
+		}
+	}
+	f.mu.Unlock()
+	// The destination directory itself was created.
+	listing := runJSON(t, r, []string{"ls", "/个人文档", "--json"}, 0)
+	assertListingIncludes(t, listing, "/个人文档/上传树")
+}
+
+func TestCLITreePutSkipExisting(t *testing.T) {
+	f := newFixture(t)
+	r := newRuntime(t, f)
+	loginCLI(t, r)
+
+	src := t.TempDir()
+	payload := []byte("重复上传 payload\n")
+	if err := os.WriteFile(filepath.Join(src, "again.bin"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.expectFile(t, filepath.Join(src, "again.bin"), "again.bin", payload, false)
+	runJSON(t, r, []string{"put", "--recursive", src, "/个人文档/重复", "--json"}, 0)
+
+	// Re-run without --overwrite: fully skipped, zero object uploads.
+	before := f.callCountPrefix("object:")
+	rerun := runJSON(t, r, []string{"put", "--recursive", src, "/个人文档/重复", "--json"}, 0)
+	uploads := rerun["uploads"].([]any)
+	if len(uploads) != 0 {
+		t.Fatalf("uploads=%v", uploads)
+	}
+	skipped := rerun["skipped"].([]any)
+	if len(skipped) != 1 || skipped[0].(map[string]any)["reason"] != "exists" {
+		t.Fatalf("skipped=%v", skipped)
+	}
+	if got := f.callCountPrefix("object:") - before; got != 0 {
+		t.Fatalf("uploaded %d objects without --overwrite", got)
+	}
+
+	// With --overwrite the upload goes through again.
+	overwritten := runJSON(t, r, []string{"put", "--recursive", src, "/个人文档/重复", "--overwrite", "--json"}, 0)
+	uploads = overwritten["uploads"].([]any)
+	if len(uploads) != 1 {
+		t.Fatalf("overwrite uploads=%v", uploads)
+	}
+}
+
+func TestCLITreePutJobs(t *testing.T) {
+	f := newFixture(t)
+	r := newRuntime(t, f)
+	loginCLI(t, r)
+
+	src := t.TempDir()
+	for i := 0; i < 5; i++ {
+		name := fmt.Sprintf("f%d.bin", i)
+		payload := []byte(fmt.Sprintf("parallel payload %d\n", i))
+		if err := os.WriteFile(filepath.Join(src, name), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f.expectFile(t, filepath.Join(src, name), name, payload, false)
+	}
+	result := runJSON(t, r, []string{"put", "--recursive", src, "/个人文档/并行上传", "--jobs=4", "--json"}, 0)
+	uploads := result["uploads"].([]any)
+	if len(uploads) != 5 {
+		t.Fatalf("uploads=%d", len(uploads))
+	}
+	for i := 0; i < 5; i++ {
+		if got := f.fileBytes(fmt.Sprintf("/个人文档/并行上传/f%d.bin", i)); len(got) == 0 {
+			t.Fatalf("f%d.bin missing", i)
+		}
+	}
+}
+
+func TestCLITreeGetJobs(t *testing.T) {
+	f, r, tree := treeDownloadFixture(t)
+	f.addFile(tree.ID, "extra-1.txt", []byte("extra one\n"))
+	f.addFile(tree.ID, "extra-2.txt", []byte("extra two\n"))
+	dst := t.TempDir()
+	result := runJSON(t, r, []string{"get", "--recursive", tree.Path, dst, "--jobs=4", "--json"}, 0)
+	downloads := result["downloads"].([]any)
+	if len(downloads) != 5 {
+		t.Fatalf("downloads=%d", len(downloads))
+	}
+	for _, name := range []string{"报告.csv", "top.txt", "extra-1.txt", "extra-2.txt"} {
+		if _, err := os.Stat(filepath.Join(dst, name)); err != nil {
+			t.Fatalf("%s missing: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dst, "数据", "样本.csv")); err != nil {
+		t.Fatalf("nested file missing: %v", err)
+	}
 }

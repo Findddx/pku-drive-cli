@@ -19,6 +19,7 @@ import (
 	"github.com/Findddx/pku-drive-cli/internal/oauth"
 	"github.com/Findddx/pku-drive-cli/internal/remote"
 	"github.com/Findddx/pku-drive-cli/internal/sharelink"
+	"github.com/Findddx/pku-drive-cli/internal/transfer"
 	"github.com/Findddx/pku-drive-cli/internal/upload"
 )
 
@@ -50,6 +51,7 @@ type remoteOperations interface {
 	Resolve(context.Context, string) (anyshare.Item, error)
 	ResolveUploadTarget(context.Context, string, string) (remote.UploadTarget, error)
 	Delete(context.Context, string, bool) (remote.DeleteResult, error)
+	WalkFiles(context.Context, string) ([]anyshare.Item, error)
 }
 
 type uploaderOperations interface {
@@ -58,6 +60,7 @@ type uploaderOperations interface {
 
 type downloaderOperations interface {
 	Get(context.Context, anyshare.Item, string, bool, download.Progress) (download.Result, error)
+	GetAt(context.Context, anyshare.Item, *download.DestinationRoot, string, bool, download.Progress) (download.Result, error)
 }
 
 type shareOperations interface {
@@ -201,6 +204,22 @@ func dependenciesFromServices(services dependencyServices) cli.Dependencies {
 			}
 			return cli.GetResult{RemotePath: item.Path, RemoteID: result.RemoteID, Revision: result.Revision, LocalPath: result.LocalPath, Size: result.Size}, nil
 		},
+		GetTree: func(ctx context.Context, remotePath, localDir string, overwrite bool, jobs int, progress upload.Progress) (cli.TreeGetResult, error) {
+			report, err := transfer.DownloadTree(ctx, services.remote, services.downloader,
+				remotePath, localDir, transfer.Options{Overwrite: overwrite, Jobs: jobs}, progress)
+			if err != nil {
+				return cli.TreeGetResult{Downloads: treeDownloads(report), Skipped: treeSkipped(report.Skipped)}, err
+			}
+			return cli.TreeGetResult{Downloads: treeDownloads(report), Skipped: treeSkipped(report.Skipped)}, nil
+		},
+		PutTree: func(ctx context.Context, localDir, remotePath string, overwrite bool, jobs int, progress upload.Progress) (cli.TreePutResult, error) {
+			report, err := transfer.UploadTree(ctx, services.remote, services.uploader,
+				localDir, remotePath, transfer.Options{Overwrite: overwrite, Jobs: jobs}, progress)
+			if err != nil {
+				return cli.TreePutResult{Uploads: treeUploads(report), Skipped: treeSkipped(report.Skipped)}, err
+			}
+			return cli.TreePutResult{Uploads: treeUploads(report), Skipped: treeSkipped(report.Skipped)}, nil
+		},
 		OpenShare: func(ctx context.Context, rawLink string) (cli.ShareSession, error) {
 			if services.shares == nil {
 				return nil, apperr.Wrap(apperr.Local, "share link", "share dependency unavailable", errors.New("missing share dependency"))
@@ -259,6 +278,39 @@ func itemResult(item anyshare.Item) cli.ItemResult {
 	return cli.ItemResult{Name: item.Name, RemotePath: item.Path, Type: item.Type, RemoteID: remoteID, Size: item.Size, Modified: item.Modified}
 }
 
+func treeDownloads(report transfer.DownloadReport) []cli.GetResult {
+	downloads := make([]cli.GetResult, len(report.Completed))
+	for index, completed := range report.Completed {
+		downloads[index] = cli.GetResult{
+			RemotePath: completed.RemotePath, RemoteID: completed.Result.RemoteID,
+			Revision: completed.Result.Revision, LocalPath: completed.Result.LocalPath, Size: completed.Result.Size,
+		}
+	}
+	return downloads
+}
+
+func treeUploads(report transfer.UploadReport) []cli.PutResult {
+	uploads := make([]cli.PutResult, len(report.Completed))
+	for index, completed := range report.Completed {
+		uploads[index] = cli.PutResult{
+			RemotePath: completed.Result.RemotePath, RemoteID: completed.Result.RemoteID,
+			Revision: completed.Result.Revision, Size: completed.Result.Size,
+			Resumed: completed.Result.Resumed, Instant: completed.Result.Instant,
+			Multipart: completed.Result.Multipart, PartsTotal: completed.Result.PartsTotal,
+			PartsResumed: completed.Result.PartsResumed, PartsUploaded: completed.Result.PartsUploaded,
+		}
+	}
+	return uploads
+}
+
+func treeSkipped(skipped []transfer.Skipped) []cli.SkippedItem {
+	result := make([]cli.SkippedItem, len(skipped))
+	for index, item := range skipped {
+		result[index] = cli.SkippedItem{Path: item.Path, Reason: string(item.Reason)}
+	}
+	return result
+}
+
 func unavailableDependencies(cause error) cli.Dependencies {
 	failure := func(ctx context.Context, operation string) error {
 		if err := ctx.Err(); err != nil {
@@ -278,6 +330,12 @@ func unavailableDependencies(cause error) cli.Dependencies {
 		},
 		Get: func(ctx context.Context, _, _ string, _ bool, _ upload.Progress) (cli.GetResult, error) {
 			return cli.GetResult{}, failure(ctx, "get")
+		},
+		GetTree: func(ctx context.Context, _, _ string, _ bool, _ int, _ upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{}, failure(ctx, "recursive get")
+		},
+		PutTree: func(ctx context.Context, _, _ string, _ bool, _ int, _ upload.Progress) (cli.TreePutResult, error) {
+			return cli.TreePutResult{}, failure(ctx, "recursive put")
 		},
 		OpenShare: func(ctx context.Context, _ string) (cli.ShareSession, error) {
 			return nil, failure(ctx, "share link")
