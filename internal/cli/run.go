@@ -46,10 +46,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		allowed["parents"] = true
 	}
 	if command == "put" {
-		allowed["overwrite"], allowed["quiet"] = true, true
+		allowed["overwrite"], allowed["quiet"], allowed["recursive"], allowed["jobs"] = true, true, true, true
 	}
 	if command == "get" {
-		allowed["overwrite"], allowed["quiet"], allowed["share"] = true, true, true
+		allowed["overwrite"], allowed["quiet"], allowed["share"], allowed["recursive"], allowed["jobs"] = true, true, true, true, true
 	}
 	if command == "ls" {
 		allowed["share"] = true
@@ -69,6 +69,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	flags.SetOutput(&flagOutput)
 	jsonMode := flags.Bool("json", false, "emit JSON")
 	var parents, overwrite, quiet, recursive, localOnly, pasteCallback, shareMode *bool
+	var jobs *int
 	if command == "login" {
 		pasteCallback = flags.Bool("paste-callback", false, "paste the browser callback URL")
 	}
@@ -78,11 +79,15 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if command == "put" {
 		overwrite = flags.Bool("overwrite", false, "overwrite existing file")
 		quiet = flags.Bool("quiet", false, "suppress progress")
+		recursive = flags.Bool("recursive", false, "transfer a directory tree")
+		jobs = flags.Int("jobs", 1, "parallel file transfers")
 	}
 	if command == "get" {
 		overwrite = flags.Bool("overwrite", false, "overwrite existing file")
 		quiet = flags.Bool("quiet", false, "suppress progress")
 		shareMode = flags.Bool("share", false, "download from a shared link")
+		recursive = flags.Bool("recursive", false, "transfer a directory tree")
+		jobs = flags.Int("jobs", 1, "parallel file transfers")
 	}
 	if command == "ls" {
 		shareMode = flags.Bool("share", false, "list a shared link")
@@ -104,6 +109,14 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	isShare := shareMode != nil && *shareMode
 	if err := validateArity(command, positionals, isShare); err != nil {
 		return renderError(renderer, err)
+	}
+	if (command == "get" || command == "put") && recursive != nil && *recursive {
+		if isShare {
+			return renderError(renderer, usageError("recursive share download is not supported"))
+		}
+	}
+	if jobs != nil && (*jobs < 1 || *jobs > 64) {
+		return renderError(renderer, usageError("--jobs must be between 1 and 64"))
 	}
 
 	if command == "version" {
@@ -189,6 +202,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 			return renderSuccess(renderer, command, structFields(result), "Directory ready: "+output.TerminalText(result.RemotePath))
 		}
 	case "put":
+		if recursive != nil && *recursive {
+			return runTreePut(commandCtx, renderer, deps, positionals, *overwrite, *jobs, *quiet)
+		}
 		var result PutResult
 		progress := output.NewProgress(stderr, *quiet, interactiveWriter(stderr), time.Now)
 		if deps.Put == nil {
@@ -204,6 +220,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "get":
 		if isShare {
 			return runShareGet(commandCtx, renderer, stdin, stderr, deps, positionals, *overwrite, *quiet, *jsonMode)
+		}
+		if recursive != nil && *recursive {
+			return runTreeGet(commandCtx, renderer, deps, positionals, *overwrite, *jobs, *quiet)
 		}
 		var result GetResult
 		progress := output.NewDownloadProgress(stderr, *quiet, interactiveWriter(stderr), time.Now)
@@ -426,6 +445,88 @@ func preserveCLIError(operation string, err error) error {
 		return err
 	}
 	return apperr.Wrap(apperr.Local, operation, "local operation failed", err)
+}
+
+func runTreeGet(ctx context.Context, renderer *output.Renderer, deps Dependencies,
+	positionals []string, overwrite bool, jobs int, quiet bool) int {
+	if deps.GetTree == nil {
+		return renderError(renderer, localError("recursive get dependency unavailable"))
+	}
+	progress := output.NewDownloadProgress(renderer.Stderr, quiet, interactiveWriter(renderer.Stderr), time.Now)
+	result, err := deps.GetTree(ctx, positionals[0], positionals[1], overwrite, jobs, progress)
+	if err != nil {
+		output.AbortProgress(progress)
+		return renderErrorFields(renderer, err, treeGetFields(result))
+	}
+	progress.Finished()
+	return renderSuccess(renderer, "get", treeGetFields(result), treeLines("Downloaded", "No files to download.", result.Downloads, result.Skipped))
+}
+
+func runTreePut(ctx context.Context, renderer *output.Renderer, deps Dependencies,
+	positionals []string, overwrite bool, jobs int, quiet bool) int {
+	if deps.PutTree == nil {
+		return renderError(renderer, localError("recursive put dependency unavailable"))
+	}
+	progress := output.NewProgress(renderer.Stderr, quiet, interactiveWriter(renderer.Stderr), time.Now)
+	result, err := deps.PutTree(ctx, positionals[0], positionals[1], overwrite, jobs, progress)
+	if err != nil {
+		output.AbortProgress(progress)
+		return renderErrorFields(renderer, err, treePutFields(result))
+	}
+	progress.Finished()
+	return renderSuccess(renderer, "put", treePutFields(result), treeLines("Uploaded", "No files to upload.", result.Uploads, result.Skipped))
+}
+
+// treeLines renders the multi-line human output shared by both tree commands.
+func treeLines[T any](verb, empty string, completed []T, skipped []SkippedItem) string {
+	lines := make([]string, 0, len(completed)+len(skipped))
+	for _, item := range completed {
+		switch result := any(item).(type) {
+		case GetResult:
+			lines = append(lines, verb+": "+output.TerminalText(result.LocalPath))
+		case PutResult:
+			lines = append(lines, verb+": "+output.TerminalText(result.RemotePath))
+		}
+	}
+	for _, item := range skipped {
+		lines = append(lines, "Skipped: "+output.TerminalText(item.Path)+" ("+string(item.Reason)+")")
+	}
+	if len(lines) == 0 {
+		return empty
+	}
+	return strings.Join(lines, "\n")
+}
+
+func treeGetFields(result TreeGetResult) map[string]any {
+	downloads := result.Downloads
+	if downloads == nil {
+		downloads = make([]GetResult, 0)
+	}
+	skipped := result.Skipped
+	if skipped == nil {
+		skipped = make([]SkippedItem, 0)
+	}
+	return map[string]any{"downloads": downloads, "skipped": skipped}
+}
+
+func treePutFields(result TreePutResult) map[string]any {
+	uploads := result.Uploads
+	if uploads == nil {
+		uploads = make([]PutResult, 0)
+	}
+	skipped := result.Skipped
+	if skipped == nil {
+		skipped = make([]SkippedItem, 0)
+	}
+	return map[string]any{"uploads": uploads, "skipped": skipped}
+}
+
+func renderErrorFields(renderer *output.Renderer, err error, fields map[string]any) int {
+	category, message := errorDetails(err)
+	if renderErr := renderer.FailureFields(string(category), message, fields); renderErr != nil {
+		return apperr.ExitCode(localError("write output"))
+	}
+	return apperr.ExitCode(err)
 }
 
 func validateArity(command string, args []string, shareMode bool) error {
