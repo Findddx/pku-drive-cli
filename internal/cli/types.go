@@ -78,6 +78,24 @@ type ShareSession interface {
 	Download(context.Context, []string, string, bool, upload.Progress) ([]ShareGetResult, error)
 }
 
+// SkippedItem describes one tree entry that was not transferred.
+type SkippedItem struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+// TreeGetResult is the recursive download report.
+type TreeGetResult struct {
+	Downloads []GetResult   `json:"downloads"`
+	Skipped   []SkippedItem `json:"skipped"`
+}
+
+// TreePutResult is the recursive upload report.
+type TreePutResult struct {
+	Uploads  []PutResult   `json:"uploads"`
+	Skipped  []SkippedItem `json:"skipped"`
+}
+
 // Dependencies contains the external command operations.
 type Dependencies struct {
 	Login     func(context.Context, io.Reader, io.Writer, bool) error
@@ -86,6 +104,8 @@ type Dependencies struct {
 	Mkdir     func(context.Context, string, bool) (ItemResult, error)
 	Put       func(context.Context, string, string, bool, upload.Progress) (PutResult, error)
 	Get       func(context.Context, string, string, bool, upload.Progress) (GetResult, error)
+	GetTree   func(context.Context, string, string, bool, int, upload.Progress) (TreeGetResult, error)
+	PutTree   func(context.Context, string, string, bool, int, upload.Progress) (TreePutResult, error)
 	OpenShare func(context.Context, string) (ShareSession, error)
 	Delete    func(context.Context, string, bool) (DeleteResult, error)
 	Logout    func(context.Context, bool) error

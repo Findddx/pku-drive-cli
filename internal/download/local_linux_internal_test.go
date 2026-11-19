@@ -58,7 +58,7 @@ func TestLocalTargetNoReplacePreservesRacingDestination(t *testing.T) {
 	if err := os.WriteFile(destination, []byte("racer"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := target.Install(temporary, int64(len("download"))); !errors.Is(err, errDestinationExists) {
+	if err := target.Install(temporary, int64(len("download"))); !errors.Is(err, ErrDestinationExists) {
 		t.Fatalf("install err=%v, want destination exists", err)
 	}
 	data, _ := os.ReadFile(destination)

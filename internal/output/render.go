@@ -65,6 +65,26 @@ func (r *Renderer) Failure(category, message string) error {
 	return err
 }
 
+// FailureFields outputs a failure result with structured fields. In JSON mode
+// the fields are merged into {"ok":false,"category","message"} after passing
+// the same redaction pipeline as Success; in human mode it is identical to
+// Failure (one message line on stderr).
+func (r *Renderer) FailureFields(category, message string, fields map[string]any) error {
+	if !r.JSON {
+		return r.Failure(category, message)
+	}
+	message = RedactMessage(message)
+	message = redactAllURLs(message)
+	payload := map[string]any{"ok": false, "category": category, "message": message}
+	for key, value := range fields {
+		if key == "ok" || key == "category" || key == "message" {
+			continue
+		}
+		payload[key] = redactValue(key, value)
+	}
+	return json.NewEncoder(r.Stdout).Encode(payload)
+}
+
 func redactValue(key string, value any) any {
 	if sensitiveKey(key) {
 		return "[REDACTED]"
