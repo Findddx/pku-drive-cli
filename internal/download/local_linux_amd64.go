@@ -27,6 +27,15 @@ const (
 	randomNameTries   = 128
 )
 
+// Filesystem type magic numbers (see statfs(2)) for filesystems that do not
+// present trustworthy POSIX permission bits: they may ignore the mode requested
+// at creation and/or chmod, reporting a fixed default such as 0755 instead.
+const (
+	filesystemMagicFUSEBLK = 0x65735546 // fuseblk (ntfs-3g and other FUSE block drivers)
+	filesystemMagicVFAT    = 0x4d44     // vfat / msdos
+	filesystemMagicEXFAT   = 0x2011BAB0 // exfat
+)
+
 var (
 	errDestinationExists  = errors.New("destination already exists")
 	errDestinationChanged = errors.New("destination changed during download")
@@ -39,6 +48,7 @@ type localLinuxOps struct {
 	openat         func(int, string, int, uint32) (int, error)
 	mkdirat        func(int, string, uint32) error
 	fstat          func(int, *syscall.Stat_t) error
+	statfs         func(int, *syscall.Statfs_t) error
 	close          func(int) error
 	fsync          func(int) error
 	unlinkat       func(int, string) error
@@ -51,6 +61,7 @@ var hostLocalLinuxOps = localLinuxOps{
 	openat:         syscall.Openat,
 	mkdirat:        syscall.Mkdirat,
 	fstat:          syscall.Fstat,
+	statfs:         syscall.Fstatfs,
 	close:          syscall.Close,
 	fsync:          syscall.Fsync,
 	unlinkat:       syscall.Unlinkat,
@@ -113,6 +124,10 @@ type downloadTarget struct {
 	ops       localLinuxOps
 	random    io.Reader
 	closed    bool
+	// modeEnforced records whether the filesystem backing directory presents
+	// trustworthy POSIX modes. It is computed once per target so every
+	// temporary-file validation in a download applies the same policy.
+	modeEnforced bool
 }
 
 // DestinationRoot binds an existing local directory for a group of relative
@@ -185,7 +200,7 @@ func newDownloadTarget(directory *ownedLocalFD, name string, overwrite bool, ops
 		}
 		return nil, errUnsafeLocalEntry
 	}
-	target := &downloadTarget{directory: directory, name: name, overwrite: overwrite, ops: ops, random: random}
+	target := &downloadTarget{directory: directory, name: name, overwrite: overwrite, ops: ops, random: random, modeEnforced: targetEnforcesFileModes(directory, ops)}
 	existing, err := target.openEntry(name)
 	if errors.Is(err, syscall.ENOENT) {
 		return target, nil
@@ -257,6 +272,23 @@ func (r *DestinationRoot) openTarget(relative string, overwrite bool) (*download
 		return nil, "", err
 	}
 	return target, filepath.Join(append([]string{r.path}, components...)...), nil
+}
+
+// targetEnforcesFileModes reports whether the filesystem backing the target
+// directory presents trustworthy POSIX permission bits. Some filesystems
+// (fuseblk/ntfs-3g, vfat, exfat) ignore the creation mode and chmod, so
+// verifying mode 0600 after creation would always fail there.
+func targetEnforcesFileModes(directory *ownedLocalFD, ops localLinuxOps) bool {
+	if directory == nil || directory.fd < 0 || ops.statfs == nil {
+		return true
+	}
+	var statfs syscall.Statfs_t
+	if err := ops.statfs(directory.fd, &statfs); err != nil {
+		// Unknown filesystem: keep the strict default.
+		return true
+	}
+	magic := uint64(statfs.Type)
+	return magic != filesystemMagicFUSEBLK && magic != filesystemMagicVFAT && magic != filesystemMagicEXFAT
 }
 
 func safeRelativeComponents(relative string) ([]string, error) {
@@ -414,7 +446,7 @@ func (t *downloadTarget) CreateTemp() (*downloadTemporary, error) {
 	if named != "" {
 		links = 1
 	}
-	if !validTemporaryStat(&stat, links, 0) {
+	if !validTemporaryStat(&stat, links, 0, t.modeEnforced) {
 		_ = t.ops.close(fd)
 		if named != "" {
 			_, _ = t.unlinkIfIdentity(named, identityOf(&stat))
@@ -436,8 +468,17 @@ func unsupportedTmpfile(err error) bool {
 	return errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOENT)
 }
 
-func validTemporaryStat(stat *syscall.Stat_t, links uint64, size int64) bool {
-	return stat.Mode&syscall.S_IFMT == syscall.S_IFREG && stat.Mode&0o7777 == 0o600 && stat.Uid == uint32(os.Geteuid()) && stat.Nlink == links && stat.Size == size
+// validTemporaryStat checks that the temporary file is still a regular file
+// owned by the effective user with the expected link count and size. On
+// filesystems that present trustworthy modes the file must also keep exactly
+// mode 0600; on filesystems that cannot represent the requested mode
+// (modeEnforced false) the permission-bit assertion is skipped and the
+// ownership, type, link-count and size checks remain in force.
+func validTemporaryStat(stat *syscall.Stat_t, links uint64, size int64, modeEnforced bool) bool {
+	if stat.Mode&syscall.S_IFMT != syscall.S_IFREG || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != links || stat.Size != size {
+		return false
+	}
+	return !modeEnforced || stat.Mode&0o7777 == 0o600
 }
 
 func (t *downloadTemporary) File() *os.File { return t.file }
@@ -454,7 +495,7 @@ func (t *downloadTemporary) validate(size int64, links uint64, validateOrigin bo
 	if err := t.target.ops.fstat(int(t.file.Fd()), &stat); err != nil {
 		return err
 	}
-	if !sameIdentity(&stat, t.identity) || !validTemporaryStat(&stat, links, size) {
+	if !sameIdentity(&stat, t.identity) || !validTemporaryStat(&stat, links, size, t.target.modeEnforced) {
 		return errTemporaryChanged
 	}
 	if validateOrigin && t.namedOrigin != "" {
