@@ -28,7 +28,7 @@ const (
 )
 
 var (
-	errDestinationExists  = errors.New("destination already exists")
+	ErrDestinationExists  = errors.New("destination already exists")
 	errDestinationChanged = errors.New("destination changed during download")
 	errTemporaryChanged   = errors.New("download temporary file changed")
 	errUnsafeLocalEntry   = errors.New("unsafe local filesystem entry")
@@ -197,7 +197,7 @@ func newDownloadTarget(directory *ownedLocalFD, name string, overwrite bool, ops
 	if !overwrite {
 		_ = existing.Close()
 		_ = target.Close()
-		return nil, errDestinationExists
+		return nil, ErrDestinationExists
 	}
 	if existing.stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		_ = existing.Close()
@@ -529,7 +529,7 @@ func (t *downloadTarget) Install(temporary *downloadTemporary, size int64) error
 func (t *downloadTarget) installNoReplace(temporary *downloadTemporary) error {
 	if err := t.ops.linkFD(int(temporary.file.Fd()), t.directory.fd, t.name); err != nil {
 		if errors.Is(err, syscall.EEXIST) {
-			return errDestinationExists
+			return ErrDestinationExists
 		}
 		return err
 	}

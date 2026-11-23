@@ -43,6 +43,7 @@ type calls struct {
 	shareListDir string
 	sharePaths   []string
 	shareLocal   string
+	treeJobs     int
 }
 
 type shareSessionFake struct {
@@ -477,7 +478,7 @@ func TestRunUsageErrors(t *testing.T) {
 	tests := [][]string{
 		{}, {"download"}, {"login", "extra"}, {"status", "extra"}, {"ls", "a", "b"}, {"mkdir"}, {"mkdir", "a", "b"},
 		{"put", "local"}, {"put", "local", "remote", "extra"}, {"get", "remote"}, {"get", "remote", "local", "extra"}, {"rm"}, {"rm", "a", "b"}, {"logout", "extra"}, {"version", "extra"},
-		{"ls", "--quiet"}, {"status", "--paste-callback"}, {"mkdir", "--overwrite", "/a"}, {"put", "--parents", "a", "b"}, {"get", "--recursive", "a", "b"}, {"rm", "--overwrite", "/a"},
+		{"ls", "--quiet"}, {"status", "--paste-callback"}, {"mkdir", "--overwrite", "/a"}, {"put", "--parents", "a", "b"}, {"rm", "--overwrite", "/a"}, {"get", "--jobs=1", "a", "b", "c"}, {"get", "--jobs", "a", "b"}, {"put", "--recursive", "a"}, {"put", "--recursive", "a", "b", "c"},
 		{"mkdir", "--parents", "--parents", "/a"}, {"status", "--json", "--json"}, {"put", "--quiet=maybe", "a", "b"},
 	}
 	for _, args := range tests {
@@ -790,4 +791,400 @@ func TestRunGetFailureDoesNotReportCompleteProgress(t *testing.T) {
 	if !strings.Contains(stderr, "Downloaded 4/10 bytes") || strings.Contains(stderr, "Downloaded 10/10 bytes") {
 		t.Fatalf("false completion in stderr=%q", stderr)
 	}
+}
+
+func TestRunTreeGetJSONSuccessAndEmptyBatch(t *testing.T) {
+	t.Run("two-file JSON success with key order and arrays", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.GetTree = func(ctx context.Context, remote, local string, overwrite bool, jobs int, progress upload.Progress) (cli.TreeGetResult, error) {
+			c.getRemote, c.getLocal, c.getOverwrite, c.deadline, c.progressSet = remote, local, overwrite, remaining(ctx), progress != nil
+			c.treeJobs = jobs
+			if progress != nil {
+				progress.Started(11)
+				progress.Advanced(11)
+				progress.Finished()
+			}
+			return cli.TreeGetResult{
+				Downloads: []cli.GetResult{
+					{RemotePath: "/d/a.csv", RemoteID: "doc-a", Revision: "r1", LocalPath: "/dst/a.csv", Size: 5},
+					{RemotePath: "/d/数据/b.csv", RemoteID: "doc-b", Revision: "r2", LocalPath: "/dst/数据/b.csv", Size: 6},
+				},
+				Skipped: []cli.SkippedItem{{Path: "旧/c.csv", Reason: "exists"}},
+			}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/d", "/dst", "--jobs=4", "--json"}, deps)
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		if c.treeJobs != 4 {
+			t.Fatalf("calls=%+v", c)
+		}
+		got := decodeOne(t, stdout)
+		if got["ok"] != true || got["operation"] != "get" {
+			t.Fatalf("envelope=%v", got)
+		}
+		downloads, ok := got["downloads"].([]any)
+		if !ok || len(downloads) != 2 {
+			t.Fatalf("downloads=%T %v", got["downloads"], got["downloads"])
+		}
+		first := downloads[0].(map[string]any)
+		if first["remote_path"] != "/d/a.csv" || first["local_path"] != "/dst/a.csv" || first["size"] != float64(5) {
+			t.Fatalf("download=%v", first)
+		}
+		skipped, ok := got["skipped"].([]any)
+		if !ok || len(skipped) != 1 || skipped[0].(map[string]any)["reason"] != "exists" {
+			t.Fatalf("skipped=%T %v", got["skipped"], got["skipped"])
+		}
+	})
+
+	t.Run("empty batch emits empty arrays", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/empty", "/dst", "--json"}, deps)
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		downloads, okD := got["downloads"].([]any)
+		skipped, okS := got["skipped"].([]any)
+		if !okD || !okS || len(downloads) != 0 || len(skipped) != 0 {
+			t.Fatalf("empty arrays=%T/%T %v/%v", got["downloads"], got["skipped"], got["downloads"], got["skipped"])
+		}
+	})
+
+	t.Run("human multi-line output", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{
+				Downloads: []cli.GetResult{{LocalPath: "/dst/report.csv"}},
+				Skipped:   []cli.SkippedItem{{Path: "数据/old.csv", Reason: "exists"}},
+			}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/d", "/dst"}, deps)
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		want := "Downloaded: /dst/report.csv\nSkipped: 数据/old.csv (exists)\n"
+		if stdout != want {
+			t.Fatalf("stdout=%q want=%q", stdout, want)
+		}
+	})
+
+	t.Run("empty batch human message", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/empty", "/dst"}, deps)
+		if code != 0 || stdout != "No files to download.\n" || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+}
+
+func TestRunTreePutJSONAndHuman(t *testing.T) {
+	t.Run("JSON success", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.PutTree = func(ctx context.Context, local, remote string, overwrite bool, jobs int, progress upload.Progress) (cli.TreePutResult, error) {
+			c.localPath, c.remotePath, c.overwrite, c.deadline = local, remote, overwrite, remaining(ctx)
+			c.treeJobs = jobs
+			if progress != nil {
+				progress.Started(7)
+				progress.Advanced(7)
+				progress.Finished()
+			}
+			return cli.TreePutResult{
+				Uploads:  []cli.PutResult{{RemotePath: "/d/x.bin", RemoteID: "doc-x", Revision: "r1", Size: 7}},
+				Skipped: []cli.SkippedItem{{Path: "link", Reason: "symlink"}},
+			}, nil
+		}
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./src", "/d", "--overwrite", "--json"}, deps)
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		if c.localPath != "./src" || c.remotePath != "/d" || !c.overwrite || c.treeJobs != 1 {
+			t.Fatalf("calls=%+v", c)
+		}
+		got := decodeOne(t, stdout)
+		if got["ok"] != true || got["operation"] != "put" {
+			t.Fatalf("envelope=%v", got)
+		}
+		uploads, ok := got["uploads"].([]any)
+		if !ok || len(uploads) != 1 || uploads[0].(map[string]any)["remote_path"] != "/d/x.bin" {
+			t.Fatalf("uploads=%T %v", got["uploads"], got["uploads"])
+		}
+		skipped := got["skipped"].([]any)
+		if len(skipped) != 1 || skipped[0].(map[string]any)["reason"] != "symlink" {
+			t.Fatalf("skipped=%v", skipped)
+		}
+	})
+
+	t.Run("human output", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.PutTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreePutResult, error) {
+			return cli.TreePutResult{
+				Uploads:  []cli.PutResult{{RemotePath: "/远端/上传/x.bin"}},
+				Skipped: []cli.SkippedItem{{Path: "symlinked", Reason: "symlink"}},
+			}, nil
+		}
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./src", "/远端/上传"}, deps)
+		if code != 0 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		want := "Uploaded: /远端/上传/x.bin\nSkipped: symlinked (symlink)\n"
+		if stdout != want {
+			t.Fatalf("stdout=%q want=%q", stdout, want)
+		}
+	})
+
+	t.Run("empty batch human message", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.PutTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreePutResult, error) {
+			return cli.TreePutResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./empty-src", "/d"}, deps)
+		if code != 0 || stdout != "No files to upload.\n" || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+}
+
+func TestRunTreeJobsFlagForms(t *testing.T) {
+	t.Run("jobs after positionals with space swallows the remote path", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		called := false
+		deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+			called = true
+			return cli.TreeGetResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/a/b", "./dst", "--jobs", "4"}, deps)
+		if code != 2 || called {
+			t.Fatalf("code=%d called=%v stdout=%q stderr=%q", code, called, stdout, stderr)
+		}
+	})
+
+	t.Run("jobs space form adjacent to flag parses to dependency", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.GetTree = func(_ context.Context, _, _ string, _ bool, jobs int, _ upload.Progress) (cli.TreeGetResult, error) {
+			c.treeJobs = jobs
+			return cli.TreeGetResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "--jobs", "4", "/a/b", "./dst"}, deps)
+		if code != 0 || c.treeJobs != 4 {
+			t.Fatalf("code=%d jobs=%d stdout=%q stderr=%q", code, c.treeJobs, stdout, stderr)
+		}
+	})
+
+	t.Run("jobs equals form forwards to dependency", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.PutTree = func(_ context.Context, _, _ string, _ bool, jobs int, _ upload.Progress) (cli.TreePutResult, error) {
+			c.treeJobs = jobs
+			return cli.TreePutResult{}, nil
+		}
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./src", "/a/b", "--jobs=4"}, deps)
+		if code != 0 || c.treeJobs != 4 {
+			t.Fatalf("code=%d jobs=%d stdout=%q stderr=%q", code, c.treeJobs, stdout, stderr)
+		}
+	})
+
+	for _, value := range []string{"0", "65", "x"} {
+		value := value
+		t.Run("--jobs="+value+" is usage error", func(t *testing.T) {
+			deps := treeDependencies(new(calls))
+			called := false
+			deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+				called = true
+				return cli.TreeGetResult{}, nil
+			}
+			code, stdout, stderr := run(t, []string{"get", "--recursive", "/a", "./dst", "--jobs="+value}, deps)
+			if code != 2 || called {
+				t.Fatalf("value=%s code=%d called=%v stdout=%q stderr=%q", value, code, called, stdout, stderr)
+			}
+		})
+	}
+
+	t.Run("bare --jobs is a flag parse error", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		code, _, _ := run(t, []string{"get", "--recursive", "--jobs", "--json"}, deps)
+		if code != 2 {
+			t.Fatal("bare --jobs must be a parse error")
+		}
+	})
+}
+
+func TestRunTreeUsageRejections(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"share plus recursive", []string{"get", "--share", "https://disk.example.invalid/link/Link", "/dst", "--recursive"}},
+		{"virtual root get", []string{"get", "--recursive", "/", "/dst"}},
+		{"virtual root put", []string{"put", "--recursive", "./src", "/"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			deps := treeDependencies(new(calls))
+			called := false
+			deps.GetTree = func(_ context.Context, remote, _ string, _ bool, _ int, _ upload.Progress) (cli.TreeGetResult, error) {
+				called = true
+				if remote == "/" {
+					return cli.TreeGetResult{}, apperr.Wrap(apperr.Usage, "get tree", "remote root is virtual", errors.New("invalid command line"))
+				}
+				return cli.TreeGetResult{}, nil
+			}
+			deps.PutTree = func(_ context.Context, _, remote string, _ bool, _ int, _ upload.Progress) (cli.TreePutResult, error) {
+				called = true
+				if remote == "/" {
+					return cli.TreePutResult{}, apperr.Wrap(apperr.Usage, "put tree", "remote root is virtual", errors.New("invalid command line"))
+				}
+				return cli.TreePutResult{}, nil
+			}
+			code, _, stderr := run(t, test.args, deps)
+			if test.args[0] == "get" && test.args[len(test.args)-2] == "/" || test.args[0] == "put" && test.args[len(test.args)-1] == "/" {
+				if code != 2 || !called {
+					t.Fatalf("code=%d called=%v stderr=%q", code, called, stderr)
+				}
+				return
+			}
+			if code != 2 || called {
+				t.Fatalf("code=%d called=%v stderr=%q", code, called, stderr)
+			}
+		})
+	}
+
+	t.Run("relative remote path rejected before network via transfer layer", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.GetTree = func(_ context.Context, remote, _ string, _ bool, _ int, _ upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{}, apperr.Wrap(apperr.Usage, "get tree", "remote path must be absolute", errors.New("invalid path"))
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "relative", "/dst", "--json"}, deps)
+		if code != 2 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		if got["category"] != "usage" {
+			t.Fatalf("envelope=%v", got)
+		}
+	})
+}
+
+func TestRunTreeRecursiveAfterPositionalsIsReordered(t *testing.T) {
+	c := new(calls)
+	deps := treeDependencies(c)
+	deps.GetTree = func(_ context.Context, remote, local string, _ bool, _ int, _ upload.Progress) (cli.TreeGetResult, error) {
+		c.getRemote, c.getLocal = remote, local
+		return cli.TreeGetResult{}, nil
+	}
+	code, _, stderr := run(t, []string{"get", "/a", "./d", "--recursive"}, deps)
+	if code != 0 || stderr != "" {
+		t.Fatalf("code=%d stderr=%q", code, stderr)
+	}
+	if c.getRemote != "/a" || c.getLocal != "./d" {
+		t.Fatalf("calls=%+v", c)
+	}
+}
+
+func TestRunTreeNilDependenciesAreLocal(t *testing.T) {
+	t.Run("get", func(t *testing.T) {
+		deps := dependencies(new(calls))
+		deps.GetTree = nil
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/a", "./d"}, deps)
+		if code != 6 || stdout != "" || stderr == "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+	t.Run("put", func(t *testing.T) {
+		deps := dependencies(new(calls))
+		deps.PutTree = nil
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./s", "/d"}, deps)
+		if code != 6 || stdout != "" || stderr == "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+}
+
+func TestRunTreePartialFailureCarriesCompletedAndSkipped(t *testing.T) {
+	t.Run("get JSON failure body keeps completed list", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+			return cli.TreeGetResult{
+				Downloads: []cli.GetResult{{RemotePath: "/d/one.csv", RemoteID: "doc-1", Revision: "r1", LocalPath: "/dst/one.csv", Size: 3}},
+				Skipped:   []cli.SkippedItem{{Path: "two.csv", Reason: "exists"}},
+			}, apperr.Wrap(apperr.Network, "get tree", "download stopped after 1 completed file(s); completed files remain in destination", errors.New("connection reset"))
+		}
+		code, stdout, stderr := run(t, []string{"get", "--recursive", "/d", "/dst", "--json"}, deps)
+		if code != 5 || stderr != "" {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+		got := decodeOne(t, stdout)
+		if got["ok"] != false || got["category"] != "network" {
+			t.Fatalf("envelope=%v", got)
+		}
+		downloads, ok := got["downloads"].([]any)
+		if !ok || len(downloads) != 1 || downloads[0].(map[string]any)["remote_path"] != "/d/one.csv" {
+			t.Fatalf("downloads=%T %v", got["downloads"], got["downloads"])
+		}
+		skipped := got["skipped"].([]any)
+		if len(skipped) != 1 || skipped[0].(map[string]any)["path"] != "two.csv" {
+			t.Fatalf("skipped=%v", skipped)
+		}
+	})
+
+	t.Run("put human failure is one stderr line with exit category", func(t *testing.T) {
+		deps := treeDependencies(new(calls))
+		deps.PutTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreePutResult, error) {
+			return cli.TreePutResult{
+				Uploads: []cli.PutResult{{RemotePath: "/d/one.bin", RemoteID: "doc-1", Revision: "r1", Size: 3}},
+			}, apperr.Wrap(apperr.Remote, "put tree", "upload stopped after 1 completed file(s); completed files remain on the remote", errors.New("conflict"))
+		}
+		code, stdout, stderr := run(t, []string{"put", "--recursive", "./src", "/d"}, deps)
+		if code != 4 || stdout != "" || !strings.Contains(stderr, "upload stopped after 1 completed file(s)") {
+			t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		}
+	})
+}
+
+func TestRunTreeDeadlinesStayAt24Hours(t *testing.T) {
+	t.Run("get recursive", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.GetTree = func(ctx context.Context, _, _ string, _ bool, _ int, _ upload.Progress) (cli.TreeGetResult, error) {
+			c.deadline = remaining(ctx)
+			return cli.TreeGetResult{}, nil
+		}
+		code, _, stderr := run(t, []string{"get", "--recursive", "/a", "./d"}, deps)
+		if code != 0 || c.deadline < 24*time.Hour-time.Second || c.deadline > 24*time.Hour {
+			t.Fatalf("deadline=%s stderr=%q", c.deadline, stderr)
+		}
+	})
+	t.Run("put recursive", func(t *testing.T) {
+		c := new(calls)
+		deps := treeDependencies(c)
+		deps.PutTree = func(ctx context.Context, _, _ string, _ bool, _ int, _ upload.Progress) (cli.TreePutResult, error) {
+			c.deadline = remaining(ctx)
+			return cli.TreePutResult{}, nil
+		}
+		code, _, stderr := run(t, []string{"put", "--recursive", "./s", "/d"}, deps)
+		if code != 0 || c.deadline < 24*time.Hour-time.Second || c.deadline > 24*time.Hour {
+			t.Fatalf("deadline=%s stderr=%q", c.deadline, stderr)
+		}
+	})
+}
+
+// treeDependencies wraps the shared fake constructor with tree stubs.
+func treeDependencies(c *calls) cli.Dependencies {
+	deps := dependencies(c)
+	deps.GetTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreeGetResult, error) {
+		return cli.TreeGetResult{}, nil
+	}
+	deps.PutTree = func(context.Context, string, string, bool, int, upload.Progress) (cli.TreePutResult, error) {
+		return cli.TreePutResult{}, nil
+	}
+	return deps
 }

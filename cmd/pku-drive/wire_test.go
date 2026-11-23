@@ -191,6 +191,8 @@ type remoteDouble struct {
 	deletePath        string
 	deleteRecursive   bool
 	deleteResult      remote.DeleteResult
+	walkRoot          string
+	walkedFiles       []anyshare.Item
 }
 
 func (service *remoteDouble) List(context.Context, string) ([]anyshare.Item, error) {
@@ -207,6 +209,10 @@ func (service *remoteDouble) ResolveUploadTarget(_ context.Context, base, path s
 func (service *remoteDouble) Resolve(_ context.Context, path string) (anyshare.Item, error) {
 	service.itemResolvePath = path
 	return service.resolvedItem, nil
+}
+func (service *remoteDouble) WalkFiles(_ context.Context, root string) ([]anyshare.Item, error) {
+	service.walkRoot = root
+	return service.walkedFiles, nil
 }
 func (service *remoteDouble) Delete(_ context.Context, path string, recursive bool) (remote.DeleteResult, error) {
 	service.deletePath, service.deleteRecursive = path, recursive
@@ -238,10 +244,17 @@ type downloaderDouble struct {
 	overwrite bool
 	progress  download.Progress
 	result    download.Result
+	root      *download.DestinationRoot
 }
 
 func (downloader *downloaderDouble) Get(_ context.Context, item anyshare.Item, localPath string, overwrite bool, progress download.Progress) (download.Result, error) {
 	downloader.item, downloader.localPath, downloader.overwrite, downloader.progress = item, localPath, overwrite, progress
+	return downloader.result, nil
+}
+
+func (downloader *downloaderDouble) GetAt(_ context.Context, item anyshare.Item, root *download.DestinationRoot, relativePath string, overwrite bool, progress download.Progress) (download.Result, error) {
+	downloader.item, downloader.localPath, downloader.overwrite, downloader.progress = item, relativePath, overwrite, progress
+	downloader.root = root
 	return downloader.result, nil
 }
 
@@ -346,6 +359,54 @@ func TestDownloadDestinationDirectoryAndTrailingSlashRules(t *testing.T) {
 	}
 	if _, err := downloadDestination(directory, "../escape"); apperr.ExitCode(err) != 6 {
 		t.Fatalf("unsafe remote name err=%v", err)
+	}
+}
+
+func TestDependenciesFromServicesMapsTreeTransfers(t *testing.T) {
+	// Mutation caught: dropping report entries, losing skip reasons, or
+	// bypassing transfer.DownloadTree/UploadTree wiring.
+	service := &remoteDouble{
+		walkedFiles: []anyshare.Item{{ID: "doc-walk", Name: "a.csv", Path: "/src/a.csv", Type: "file", Rev: "r1", Size: 5}},
+	}
+	downloadService := &downloaderDouble{result: download.Result{LocalPath: "/dst/a.csv", RemoteID: "doc-walk", Revision: "r1", Size: 5}}
+	progress := new(progressDouble)
+	deps := dependenciesFromServices(dependencyServices{remote: service, downloader: downloadService})
+
+	gotTree, err := deps.GetTree(context.Background(), "/src", t.TempDir(), false, 2, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if service.walkRoot != "/src" {
+		t.Fatalf("walkRoot=%q", service.walkRoot)
+	}
+	wantTree := cli.TreeGetResult{
+		Downloads: []cli.GetResult{{RemotePath: "/src/a.csv", RemoteID: "doc-walk", Revision: "r1", LocalPath: "/dst/a.csv", Size: 5}},
+		Skipped:   []cli.SkippedItem{},
+	}
+	if !reflect.DeepEqual(gotTree, wantTree) {
+		t.Fatalf("GetTree=%+v want=%+v", gotTree, wantTree)
+	}
+
+	putService := &remoteDouble{}
+	uploadService := &uploaderDouble{result: upload.Result{RemotePath: "/dst/x.bin", RemoteID: "doc-x", Revision: "r2", Size: 7, PartsTotal: 1, PartsUploaded: 1}}
+	putDeps := dependenciesFromServices(dependencyServices{remote: putService, uploader: uploadService})
+	localSource := filepath.Join(t.TempDir(), "x.bin")
+	if err := os.WriteFile(localSource, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gotPut, err := putDeps.PutTree(context.Background(), localSource, "/dst", true, 3, progress)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPut := cli.TreePutResult{
+		Uploads: []cli.PutResult{{RemotePath: "/dst/x.bin", RemoteID: "doc-x", Revision: "r2", Size: 7, PartsTotal: 1, PartsUploaded: 1}},
+		Skipped: []cli.SkippedItem{},
+	}
+	if !reflect.DeepEqual(gotPut, wantPut) {
+		t.Fatalf("PutTree=%+v want=%+v", gotPut, wantPut)
+	}
+	if uploadService.localPath != localSource {
+		t.Fatalf("upload local=%q want=%q", uploadService.localPath, localSource)
 	}
 }
 
